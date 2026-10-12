@@ -26,7 +26,6 @@ if (!process.env.DATABASE_URL) {
   process.exit(1);
 }
 
-
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
 const pool = new Pool({
@@ -36,11 +35,11 @@ const pool = new Pool({
 });
 pool.on("error", (error) => console.error("Postgres pool error:", error.message));
 
-const MAX_TEXT_LENGTH = 2000; // QR capacity is lower than this at higher error-correction levels
-const COOLDOWN_MS = 1500; // minimum gap between QR generations per user
-const FLOW_TTL_MS = 10 * 60 * 1000; // guided setups expire after 10 minutes
-const MAX_IMAGE_BYTES = 10 * 1024 * 1024; // max size of an image sent for scanning
-const MAX_BULK_ITEMS = 10; // Telegram albums hold at most 10 files
+const MAX_TEXT_LENGTH = 2000;
+const COOLDOWN_MS = 1500;
+const FLOW_TTL_MS = 10 * 60 * 1000;
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const MAX_BULK_ITEMS = 10;
 const MAX_BULK_ITEM_LENGTH = 500;
 const HISTORY_PAGE_SIZE = 5;
 const SEARCH_LIMIT = 10;
@@ -48,12 +47,61 @@ const ACTIVITY_LIMIT = 15;
 const RETENTION_DAYS = Number(process.env.HISTORY_RETENTION_DAYS) || 0; // 0 = keep forever
 const DISPLAY_TZ = process.env.DISPLAY_TZ || "Africa/Lagos";
 
+// ----- Daily limits, free trials and Pro (paid with Telegram Stars) -----
+// LIMITS[feature] = [free per day, Pro per day]. Counters reset at midnight in DISPLAY_TZ.
+const LIMITS = {
+  qr: [Number(process.env.LIMIT_QR_FREE) || 20, Number(process.env.LIMIT_QR_PRO) || 200],
+  scan: [Number(process.env.LIMIT_SCAN_FREE) || 10, Number(process.env.LIMIT_SCAN_PRO) || 100],
+  print: [Number(process.env.LIMIT_PRINT_FREE) || 5, Number(process.env.LIMIT_PRINT_PRO) || 50],
+  download: [Number(process.env.LIMIT_DOWNLOAD_FREE) || 10, Number(process.env.LIMIT_DOWNLOAD_PRO) || 100],
+  bulk: [0, Number(process.env.LIMIT_BULK_PRO) || 20], // free users use trials instead
+};
+const FEATURE_LABELS = {
+  qr: "QR codes",
+  scan: "Scans",
+  print: "Print PDFs",
+  download: "Downloads",
+  bulk: "Bulk runs",
+};
+// Lifetime free trials before Stars are requested
+const TRIALS = {
+  bulk: Number(process.env.TRIALS_BULK) || 3,
+  logo: Number(process.env.TRIALS_LOGO) || 3,
+};
+const PRO_STARS = Number(process.env.PRO_PRICE_STARS) || 150;
+const PRO_DAYS = Number(process.env.PRO_DAYS) || 30;
+
 const THEMES = {
   classic: { name: "Classic", emoji: "⚫", dark: "#000000", light: "#ffffff" },
   blue: { name: "Blue", emoji: "🔵", dark: "#1d4ed8", light: "#ffffff" },
   green: { name: "Green", emoji: "🟢", dark: "#15803d", light: "#ffffff" },
   purple: { name: "Purple", emoji: "🟣", dark: "#7e22ce", light: "#ffffff" },
   red: { name: "Red", emoji: "🔴", dark: "#b91c1c", light: "#ffffff" },
+};
+
+// Colour picker swatches (hex values are checked for contrast before they are applied)
+const CODE_COLORS = [
+  { e: "⚫", name: "Black", hex: "#000000" },
+  { e: "🔵", name: "Blue", hex: "#1d4ed8" },
+  { e: "🟢", name: "Green", hex: "#15803d" },
+  { e: "🟣", name: "Purple", hex: "#7e22ce" },
+  { e: "🔴", name: "Red", hex: "#b91c1c" },
+  { e: "🟠", name: "Orange", hex: "#c2410c" },
+  { e: "🟤", name: "Brown", hex: "#78350f" },
+  { e: "🔷", name: "Navy", hex: "#1e3a8a" },
+];
+const BG_COLORS = [
+  { e: "⬜", name: "White", hex: "#ffffff" },
+  { e: "🟨", name: "Cream", hex: "#fef9c3" },
+  { e: "🟦", name: "Sky", hex: "#dbeafe" },
+  { e: "🟩", name: "Mint", hex: "#dcfce7" },
+  { e: "🟪", name: "Lilac", hex: "#f3e8ff" },
+  { e: "🟥", name: "Rose", hex: "#fee2e2" },
+  { e: "🟧", name: "Peach", hex: "#ffedd5" },
+];
+const swatchName = (list, hex) => {
+  const found = list.find((c) => c.hex === hex);
+  return found ? `${found.e} ${found.name}` : hex;
 };
 
 const SIZES = {
@@ -82,7 +130,6 @@ const SOCIALS = {
   behance: { name: "Behance", url: (h) => `https://behance.net/${h}` },
 };
 
-// Kinds of QR codes: id -> [emoji, label]. Used by history and print layouts.
 const KINDS = {
   link: ["🔗", "Link"],
   email: ["✉️", "Email"],
@@ -104,7 +151,6 @@ const KINDS = {
 const kindEmoji = (kind) => (KINDS[kind] ? KINDS[kind][0] : "🔳");
 const kindLabel = (kind) => (KINDS[kind] ? KINDS[kind][1] : "QR code");
 
-// Print layouts
 const PRINT_MODES = {
   single: { name: "Single A4 poster" },
   sheet6: { name: "Sheet of 6", cols: 2, rows: 3 },
@@ -113,46 +159,49 @@ const PRINT_MODES = {
 
 // Telegram limits: description 512 characters, short description 120 characters
 const BOT_DESCRIPTION =
-  "QR codes for menus, payments, Wi-Fi, contacts, WhatsApp, social profiles and more. Send a link or text, or pick a command.\n\n" +
-  "Built for small businesses, designers and creators: brand colours, your logo, transparent PNG, SVG, print-ready PDFs and bulk export. " +
-  "Your history is saved so you can come back to it.\n\n" +
-  "Tap Start to begin. No sign-up needed.";
+  "QR codes for menus, payments, Wi-Fi, contacts, WhatsApp, social profiles and more. Send a link or text, or tap a button.\n\n" +
+  "Brand colours, your logo, transparent PNG, SVG, print-ready PDFs and bulk export. Your history is saved.\n\n" +
+  "Tap Start. No sign-up needed.";
 
 const BOT_SHORT_DESCRIPTION =
-  "QR codes for menus, payments, WhatsApp, socials and more. Logos, SVG, print-ready PDFs and history.";
+  "QR codes for menus, payments, WhatsApp, socials and more. Logos, SVG, print PDFs.";
 
+// Short descriptions (about 25 characters) so the list looks clean on mobile
 const BOT_COMMANDS = [
-  { command: "start", description: "Start the bot" },
-  { command: "help", description: "See everything I can do" },
-  { command: "history", description: "Browse or search your past QR codes" },
-  { command: "print", description: "Print-ready PDF of your latest QR code" },
-  { command: "activity", description: "See your recent activity" },
-  { command: "menu", description: "QR code for your menu link" },
-  { command: "pay", description: "QR code for a payment link or bank details" },
-  { command: "whatsapp", description: "Click-to-chat WhatsApp QR code" },
-  { command: "product", description: "QR code with product name, price and details" },
-  { command: "review", description: "QR code for your Google review link" },
-  { command: "social", description: "QR code for a social media profile" },
-  { command: "portfolio", description: "QR code for your portfolio or website" },
-  { command: "contact", description: "Create a contact card (vCard) QR code" },
-  { command: "wifi", description: "Create a Wi-Fi QR code" },
-  { command: "email", description: "Create a pre-filled email QR code" },
-  { command: "sms", description: "Create a pre-filled SMS QR code" },
-  { command: "location", description: "Turn a location into a QR code" },
-  { command: "text", description: "Encode text exactly as typed" },
-  { command: "bulk", description: "Make up to 10 QR codes at once" },
-  { command: "colors", description: "Set brand colours, e.g. /colors #1d4ed8 #ffffff" },
-  { command: "logo", description: "Add your logo to the centre of QR codes" },
-  { command: "style", description: "Change colour, size, background and accuracy" },
-  { command: "clearhistory", description: "Delete your saved QR history" },
-  { command: "deletedata", description: "Delete everything stored about you" },
-  { command: "donate", description: "Support this bot ❤️" },
-  { command: "cancel", description: "Cancel the current setup" },
+  { command: "start", description: "Open the main menu" },
+  { command: "help", description: "All features" },
+  { command: "plan", description: "My plan and limits" },
+  { command: "history", description: "My past QR codes" },
+  { command: "print", description: "Print-ready PDF" },
+  { command: "menu", description: "Menu link QR" },
+  { command: "pay", description: "Payment QR" },
+  { command: "whatsapp", description: "WhatsApp chat QR" },
+  { command: "product", description: "Product QR" },
+  { command: "review", description: "Review link QR" },
+  { command: "social", description: "Social profile QR" },
+  { command: "portfolio", description: "Portfolio QR" },
+  { command: "contact", description: "Contact card QR" },
+  { command: "wifi", description: "Wi-Fi QR" },
+  { command: "email", description: "Email QR" },
+  { command: "sms", description: "SMS QR" },
+  { command: "location", description: "Location QR" },
+  { command: "text", description: "Exact text QR" },
+  { command: "bulk", description: "Up to 10 QR codes" },
+  { command: "colors", description: "Pick brand colours" },
+  { command: "logo", description: "Add your logo" },
+  { command: "style", description: "Colour, size, logo" },
+  { command: "activity", description: "Recent activity" },
+  { command: "clearhistory", description: "Delete my history" },
+  { command: "deletedata", description: "Delete my data" },
+  { command: "donate", description: "Support the bot ❤️" },
+  { command: "cancel", description: "Cancel current setup" },
 ];
 
 // ---------------------------------------------------------------------------
 // Database (PostgreSQL)
 // ---------------------------------------------------------------------------
+// usage_daily and user_plan intentionally have no foreign key to users, so
+// /deletedata cannot be used to reset free trials or lose a paid Pro plan.
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS users (
   id          BIGINT PRIMARY KEY,
@@ -190,6 +239,20 @@ CREATE TABLE IF NOT EXISTS activity_log (
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS activity_log_user_idx ON activity_log (user_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS usage_daily (
+  user_id     BIGINT NOT NULL,
+  day         DATE NOT NULL,
+  feature     TEXT NOT NULL,
+  used        INT NOT NULL DEFAULT 0,
+  PRIMARY KEY (user_id, day, feature)
+);
+
+CREATE TABLE IF NOT EXISTS user_plan (
+  user_id     BIGINT PRIMARY KEY,
+  pro_until   TIMESTAMPTZ,
+  trials      JSONB NOT NULL DEFAULT '{}'::jsonb
+);
 `;
 
 async function initDb() {
@@ -215,7 +278,14 @@ async function pruneOldHistory() {
   }
 }
 
-// Fire-and-forget: logging must never break the bot
+async function pruneUsage() {
+  try {
+    await pool.query("DELETE FROM usage_daily WHERE day < (now() - interval '7 days')::date");
+  } catch (error) {
+    console.error("Usage cleanup failed:", error.message);
+  }
+}
+
 function logActivity(userId, action, details = {}) {
   pool
     .query("INSERT INTO activity_log (user_id, action, details) VALUES ($1, $2, $3)", [userId, action, details])
@@ -285,13 +355,175 @@ async function saveSettings(userId) {
 }
 
 // ---------------------------------------------------------------------------
-// In-memory state (flows are short-lived; settings are cached from the database)
+// Plans, daily limits and trials
 // ---------------------------------------------------------------------------
-const settingsByUser = new Map(); // userId -> { theme, size, ecl, transparent, custom, logo }
-const flows = new Map(); // userId -> { type, index, data, expires }
-const lastActionAt = new Map(); // userId -> timestamp
-const awaitingLogo = new Map(); // userId -> expiry timestamp
-const loadedUsers = new Map(); // userId -> last time we synced this user with the database
+const todayKey = () => new Date().toLocaleDateString("en-CA", { timeZone: DISPLAY_TZ }); // YYYY-MM-DD
+
+async function getPlan(userId) {
+  try {
+    const { rows } = await pool.query("SELECT pro_until, trials FROM user_plan WHERE user_id = $1", [userId]);
+    const row = rows[0];
+    const proUntil = row && row.pro_until ? new Date(row.pro_until) : null;
+    return {
+      proUntil,
+      pro: Boolean(proUntil && proUntil > new Date()),
+      trials: (row && row.trials) || {},
+    };
+  } catch (error) {
+    console.error("getPlan failed:", error.message);
+    return { proUntil: null, pro: false, trials: {} };
+  }
+}
+
+async function getUsage(userId) {
+  try {
+    const { rows } = await pool.query("SELECT feature, used FROM usage_daily WHERE user_id = $1 AND day = $2::date", [
+      userId,
+      todayKey(),
+    ]);
+    return Object.fromEntries(rows.map((r) => [r.feature, r.used]));
+  } catch (error) {
+    console.error("getUsage failed:", error.message);
+    return {};
+  }
+}
+
+// Fails open: a database hiccup should not block people from using the bot
+async function checkQuota(userId, feature) {
+  const plan = await getPlan(userId);
+  const limit = LIMITS[feature][plan.pro ? 1 : 0];
+  const usage = await getUsage(userId);
+  const used = usage[feature] || 0;
+  return { ok: used < limit, used, limit, pro: plan.pro };
+}
+
+async function bumpUsage(userId, feature) {
+  try {
+    await pool.query(
+      `INSERT INTO usage_daily (user_id, day, feature, used) VALUES ($1, $2::date, $3, 1)
+       ON CONFLICT (user_id, day, feature) DO UPDATE SET used = usage_daily.used + 1`,
+      [userId, todayKey(), feature]
+    );
+  } catch (error) {
+    console.error("bumpUsage failed:", error.message);
+  }
+}
+
+async function useTrial(userId, feature) {
+  try {
+    await pool.query(
+      `INSERT INTO user_plan (user_id, trials) VALUES ($1, jsonb_build_object($2::text, 1))
+       ON CONFLICT (user_id) DO UPDATE SET trials = jsonb_set(
+         user_plan.trials, ARRAY[$2::text],
+         to_jsonb(COALESCE((user_plan.trials->>$2)::int, 0) + 1))`,
+      [userId, feature]
+    );
+  } catch (error) {
+    console.error("useTrial failed:", error.message);
+  }
+}
+
+async function grantPro(userId, days) {
+  const { rows } = await pool.query(
+    `INSERT INTO user_plan (user_id, pro_until) VALUES ($1, now() + ($2 || ' days')::interval)
+     ON CONFLICT (user_id) DO UPDATE SET pro_until =
+       GREATEST(COALESCE(user_plan.pro_until, now()), now()) + ($2 || ' days')::interval
+     RETURNING pro_until`,
+    [userId, String(days)]
+  );
+  return new Date(rows[0].pro_until);
+}
+
+const trialsLeft = (plan, feature) => Math.max(0, TRIALS[feature] - (plan.trials[feature] || 0));
+
+function proKeyboard(extra = []) {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback(`⭐ Get Pro · ${PRO_STARS} Stars`, "buy:pro")],
+    [Markup.button.callback("📊 My plan", "go:plan"), ...extra],
+  ]);
+}
+
+function replyLimit(ctx, feature, q) {
+  const text =
+    `⏳ Daily limit reached\n\n${FEATURE_LABELS[feature]}: ${q.used}/${q.limit} today.\n` +
+    `Resets at midnight (${DISPLAY_TZ}).` +
+    (q.pro ? "" : `\n\n⭐ Pro gives you up to ${LIMITS[feature][1]} per day.`);
+  return q.pro ? ctx.reply(text, homeButton()) : ctx.reply(text, proKeyboard());
+}
+
+function trialPaywall(ctx, feature) {
+  const name = feature === "bulk" ? "bulk" : "logo";
+  return ctx.reply(
+    `🔒 Your ${TRIALS[feature]} free ${name} trials are used up.\n\n` +
+      `⭐ Pro (${PRO_STARS} Stars, ${PRO_DAYS} days) unlocks unlimited logo, bulk and higher daily limits.`,
+    proKeyboard()
+  );
+}
+
+// Decides whether the user may run bulk now. Replies with a paywall or limit message when not.
+async function checkBulkAccess(ctx) {
+  const plan = await getPlan(ctx.from.id);
+  if (plan.pro) {
+    const q = await checkQuota(ctx.from.id, "bulk");
+    if (!q.ok) {
+      await replyLimit(ctx, "bulk", q);
+      return { ok: false };
+    }
+    return { ok: true, pro: true };
+  }
+  if (trialsLeft(plan, "bulk") <= 0) {
+    await trialPaywall(ctx, "bulk");
+    return { ok: false };
+  }
+  return { ok: true, pro: false, left: trialsLeft(plan, "bulk") };
+}
+
+// Applies the logo trial rules to a settings copy. Free users without trials left get no logo.
+async function gateLogo(userId, settings) {
+  if (!settings.logo) return { state: "none" };
+  const plan = await getPlan(userId);
+  if (plan.pro) return { state: "pro" };
+  if (trialsLeft(plan, "logo") <= 0) {
+    settings.logo = null;
+    return { state: "exhausted" };
+  }
+  return { state: "trial", left: trialsLeft(plan, "logo") };
+}
+
+async function planView(userId) {
+  const plan = await getPlan(userId);
+  const usage = await getUsage(userId);
+  const features = plan.pro ? ["qr", "scan", "print", "download", "bulk"] : ["qr", "scan", "print", "download"];
+  const lines = features.map((f) => `${FEATURE_LABELS[f]}: ${usage[f] || 0}/${LIMITS[f][plan.pro ? 1 : 0]}`);
+
+  let text =
+    `📊 Your plan: ${plan.pro ? `⭐ Pro until ${fmtDate(plan.proUntil)}` : "Free"}\n\n` +
+    `Today (resets at midnight):\n${lines.join("\n")}`;
+
+  if (plan.pro) {
+    text += "\n\nLogo and bulk: unlimited ✅";
+  } else {
+    text +=
+      `\n\n🎁 Free trials left:\nBulk: ${trialsLeft(plan, "bulk")}/${TRIALS.bulk}\n` +
+      `Logo: ${trialsLeft(plan, "logo")}/${TRIALS.logo}`;
+  }
+
+  const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback(`⭐ ${plan.pro ? "Extend Pro" : "Get Pro"} · ${PRO_STARS} Stars`, "buy:pro")],
+    [Markup.button.callback("🏠 Home", "go:home")],
+  ]);
+  return { text, keyboard };
+}
+
+// ---------------------------------------------------------------------------
+// In-memory state
+// ---------------------------------------------------------------------------
+const settingsByUser = new Map();
+const flows = new Map();
+const lastActionAt = new Map();
+const awaitingLogo = new Map();
+const awaitingHex = new Map();
+const loadedUsers = new Map();
 
 const defaultSettings = () => ({
   theme: "classic",
@@ -311,7 +543,6 @@ function getSettings(userId) {
   return settings;
 }
 
-// Settings for re-rendering an old QR code: what it looked like then, with the user's current logo if it had one
 function entrySettings(entry, userId) {
   return {
     ...defaultSettings(),
@@ -327,26 +558,33 @@ function isRateLimited(userId) {
   return false;
 }
 
-function takeLogoRequest(userId) {
-  const expires = awaitingLogo.get(userId);
+function takeFlag(map, userId) {
+  const expires = map.get(userId);
   if (!expires) return false;
-  awaitingLogo.delete(userId);
+  map.delete(userId);
   return expires > Date.now();
 }
+const takeLogoRequest = (userId) => takeFlag(awaitingLogo, userId);
+const takeHexRequest = (userId) => takeFlag(awaitingHex, userId);
 
-// Periodic cleanup so the maps don't grow forever
+function clearPending(userId) {
+  const had = flows.delete(userId) | awaitingLogo.delete(userId) | awaitingHex.delete(userId);
+  return Boolean(had);
+}
+
 setInterval(() => {
   const now = Date.now();
   for (const [userId, flow] of flows) {
     if (flow.expires < now) flows.delete(userId);
   }
-  for (const [userId, expires] of awaitingLogo) {
-    if (expires < now) awaitingLogo.delete(userId);
+  for (const map of [awaitingLogo, awaitingHex]) {
+    for (const [userId, expires] of map) {
+      if (expires < now) map.delete(userId);
+    }
   }
   for (const [userId, time] of lastActionAt) {
     if (now - time > 60 * 60 * 1000) lastActionAt.delete(userId);
   }
-  // Idle users are evicted from the cache; their settings reload from PostgreSQL on the next message
   for (const [userId, time] of loadedUsers) {
     if (now - time > 60 * 60 * 1000) {
       loadedUsers.delete(userId);
@@ -369,7 +607,7 @@ const chunk = (items, size) => {
 const slug = (text) =>
   text.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 24) || "code";
 
-const ascii = (text) => String(text).replace(/[^\x20-\x7E]/g, "").trim(); // PDF built-in fonts only cover basic characters
+const ascii = (text) => String(text).replace(/[^\x20-\x7E]/g, "").trim();
 
 const fmtDate = (date) =>
   new Date(date).toLocaleString("en-GB", {
@@ -379,6 +617,8 @@ const fmtDate = (date) =>
     minute: "2-digit",
     timeZone: DISPLAY_TZ,
   });
+
+const homeButton = () => Markup.inlineKeyboard([[Markup.button.callback("🏠 Home", "go:home")]]);
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const PHONE_LOOSE_RE = /^\+?[\d\s\-().]{5,20}$/;
@@ -403,7 +643,6 @@ function detectContent(text) {
   return { payload: text, label: "📝 Text", kind: "text" };
 }
 
-// Colour helpers (brand colours + contrast check so codes stay scannable)
 function normalizeHex(value) {
   const m = /^#?([0-9a-f]{6})$/i.exec(value || "");
   return m ? `#${m[1].toLowerCase()}` : null;
@@ -428,7 +667,6 @@ function resolveTheme(settings) {
   return THEMES[settings.theme] || THEMES.classic;
 }
 
-// Fancy captions (Telegram HTML, 1024 character limit)
 const CAPTION_LIMIT = 1024;
 const DIVIDER = "━━━━━━━━━━━━━━";
 
@@ -474,7 +712,6 @@ function qrOptions(settings, width) {
   return {
     width: width || SIZES[settings.size].px,
     margin: 2,
-    // A logo covers the centre, so force the highest error correction
     errorCorrectionLevel: settings.logo ? "H" : settings.ecl,
     color: { dark: theme.dark, light: settings.transparent ? "#00000000" : theme.light },
   };
@@ -548,7 +785,6 @@ function buildPdf(draw) {
 
 async function renderPrintPdf(entry, settings, modeId) {
   const mode = PRINT_MODES[modeId];
-  // Print always uses a solid background so the paper colour never shows through the code
   const png = await renderPng(entry.payload, { ...settings, transparent: false }, 1600);
   const label = ascii(kindLabel(entry.kind)) || "QR code";
   const today = new Date().toISOString().slice(0, 10);
@@ -558,7 +794,7 @@ async function renderPrintPdf(entry, settings, modeId) {
     const H = doc.page.height;
 
     if (modeId === "single") {
-      const size = 340; // about 12 cm
+      const size = 340;
       doc.font("Helvetica-Bold").fontSize(30).fillColor("#111111").text(label, 0, 110, { width: W, align: "center" });
       doc.image(png, (W - size) / 2, 180, { width: size });
       doc
@@ -573,7 +809,6 @@ async function renderPrintPdf(entry, settings, modeId) {
       return;
     }
 
-    // Sheet layout: a grid of identical codes with dashed cut lines
     const margin = 28;
     const cellW = (W - margin * 2) / mode.cols;
     const cellH = (H - margin * 2) / mode.rows;
@@ -606,16 +841,16 @@ async function renderPrintPdf(entry, settings, modeId) {
 function qrKeyboard(id, { reopened = false } = {}) {
   const rows = [
     [
-      Markup.button.callback("📄 HD PNG file", `dl:png:${id}`),
-      Markup.button.callback("🧩 SVG (vector)", `dl:svg:${id}`),
+      Markup.button.callback("📄 HD PNG", `dl:png:${id}`),
+      Markup.button.callback("🧩 SVG", `dl:svg:${id}`),
     ],
     [Markup.button.callback("🖨️ Print", `pr:${id}`), Markup.button.callback("📜 History", "hist:0")],
+    [Markup.button.callback("🎨 Style", "go:style"), Markup.button.callback("➕ New QR", "go:home")],
   ];
   if (reopened) rows.push([Markup.button.callback("🗑️ Delete from history", `h:del:${id}`)]);
   return Markup.inlineKeyboard(rows);
 }
 
-// Renders and sends one QR code message. `entry.id` may be null if the database was unavailable.
 async function deliverQR(ctx, entry, { reopened = false } = {}) {
   const png = await renderPng(entry.payload, entry.settings);
 
@@ -625,7 +860,6 @@ async function deliverQR(ctx, entry, { reopened = false } = {}) {
   };
   if (entry.id) extra.reply_markup = qrKeyboard(entry.id, { reopened }).reply_markup;
 
-  // Telegram flattens transparent photos, so send those as a file instead
   return entry.settings.transparent
     ? ctx.replyWithDocument({ source: png, filename: "qr-code.png" }, extra)
     : ctx.replyWithPhoto({ source: png, filename: "qr-code.png" }, extra);
@@ -639,27 +873,42 @@ async function sendQR(ctx, payload, { title = "Your QR code is ready! 📱", sum
     return ctx.reply("⏳ Please wait a moment before sending another request.");
   }
 
-  const settings = { ...getSettings(ctx.from.id) };
+  const uid = ctx.from.id;
+  const quota = await checkQuota(uid, "qr");
+  if (!quota.ok) return replyLimit(ctx, "qr", quota);
+
+  const settings = { ...getSettings(uid) };
+  const gate = await gateLogo(uid, settings); // may remove the logo when free trials are used up
   let id = null;
 
   try {
     await ctx.sendChatAction("upload_photo");
 
-    // Save to history first so the buttons can point at the saved entry
-    id = await addHistory(ctx.from.id, { kind, title, summary, payload, settings }).catch((error) => {
+    id = await addHistory(uid, { kind, title, summary, payload, settings }).catch((error) => {
       console.error("Saving history failed:", error.message);
       return null;
     });
 
     await deliverQR(ctx, { id, kind, title, summary, payload, settings });
-    logActivity(ctx.from.id, "qr_created", { kind, history_id: id });
+    await bumpUsage(uid, "qr");
+    logActivity(uid, "qr_created", { kind, history_id: id });
+
+    if (gate.state === "trial") {
+      await useTrial(uid, "logo");
+      const left = gate.left - 1;
+      const note = `🖼 Logo trial used. ${left} of ${TRIALS.logo} left.`;
+      await ctx.reply(left > 0 ? note : `${note}\nThat was your last free one.`, left > 0 ? undefined : proKeyboard());
+    } else if (gate.state === "exhausted") {
+      await ctx.reply("🔒 Free logo trials are used up, so this code has no logo.", proKeyboard());
+    }
   } catch (error) {
     console.error("QR generation failed:", error);
-    if (id) deleteHistoryEntry(ctx.from.id, id).catch(() => {}); // don't keep entries that were never delivered
+    if (id) deleteHistoryEntry(uid, id).catch(() => {});
     if (/too big|capacity/i.test(String(error && error.message))) {
       await ctx.reply(
         "That's too much data for a QR code at your current accuracy setting. " +
-          "Try shorter content, lower the error correction level with /style, or remove your logo with /logo."
+          "Try shorter content, lower the accuracy in /style, or remove your logo.",
+        Markup.inlineKeyboard([[Markup.button.callback("🎨 Open style", "go:style")]])
       );
     } else {
       await ctx.reply("Sorry, I couldn't generate that QR code.");
@@ -673,7 +922,12 @@ async function sendBulk(ctx, raw) {
     return ctx.reply("⏳ Please wait a moment before sending another request.");
   }
 
-  const settings = { ...getSettings(ctx.from.id) };
+  const uid = ctx.from.id;
+  const access = await checkBulkAccess(ctx);
+  if (!access.ok) return;
+
+  const settings = { ...getSettings(uid) };
+  await gateLogo(uid, settings); // bulk has its own trial, so a logo is only dropped if trials are gone
   const width = Math.max(SIZES.large.px, SIZES[settings.size].px);
 
   try {
@@ -693,22 +947,38 @@ async function sendBulk(ctx, raw) {
     } else {
       await ctx.replyWithMediaGroup(files.map((f) => ({ type: "document", media: f })));
     }
+
+    let trialNote = "";
+    if (access.pro) {
+      await bumpUsage(uid, "bulk");
+    } else {
+      await useTrial(uid, "bulk");
+      const left = access.left - 1;
+      trialNote = `\n\n🎁 Bulk trial used. ${left} of ${TRIALS.bulk} left.`;
+    }
+
     await ctx.reply(
       `✅ ${files.length} QR code${files.length === 1 ? "" : "s"} ready, in the order you sent them.\n` +
-        "They're saved in /history so you can reopen or print them later."
+        "Saved in /history." +
+        trialNote,
+      access.pro || access.left - 1 > 0
+        ? Markup.inlineKeyboard([
+            [Markup.button.callback("📜 History", "hist:0"), Markup.button.callback("📦 Bulk again", "go:bulk")],
+            [Markup.button.callback("🏠 Home", "go:home")],
+          ])
+        : proKeyboard([Markup.button.callback("🏠 Home", "go:home")])
     );
 
-    // Save each one to history after it was delivered
     for (const item of items) {
-      await addHistory(ctx.from.id, {
+      await addHistory(uid, {
         kind: item.kind,
         title: "Bulk QR code",
-        summary: `${KINDS[item.kind] ? KINDS[item.kind][0] : "🔳"} ${clip(item.line, 200)}`,
+        summary: `${kindEmoji(item.kind)} ${clip(item.line, 200)}`,
         payload: item.payload,
         settings,
       }).catch((error) => console.error("Saving bulk history failed:", error.message));
     }
-    logActivity(ctx.from.id, "bulk", { count: files.length });
+    logActivity(uid, "bulk", { count: files.length });
   } catch (error) {
     console.error("Bulk generation failed:", error);
     if (/too big|capacity/i.test(String(error && error.message))) {
@@ -750,20 +1020,23 @@ async function scanImage(ctx, fileId) {
     return ctx.reply("⏳ Please wait a moment before sending another request.");
   }
 
+  const quota = await checkQuota(ctx.from.id, "scan");
+  if (!quota.ok) return replyLimit(ctx, "scan", quota);
+
   try {
     await ctx.sendChatAction("typing");
 
     const buffer = await downloadFile(ctx, fileId);
     const decoded = await decodeQR(buffer);
 
-    // Only the fact that a scan happened is logged, never what was in the code
+    await bumpUsage(ctx.from.id, "scan");
     logActivity(ctx.from.id, "scan", { found: Boolean(decoded) });
 
     if (!decoded) {
       return ctx.reply(
-        "I couldn't find a readable QR code in that image. " +
-          "Try a sharper, well-lit photo with the whole code in frame. " +
-          "Sending it as a file (not a compressed photo) often helps."
+        "I couldn't find a readable QR code in that image.\n\n" +
+          "Try a sharper, well-lit photo with the whole code in frame. Sending it as a file often helps.",
+        homeButton()
       );
     }
 
@@ -771,7 +1044,10 @@ async function scanImage(ctx, fileId) {
     if (/^https?:\/\//i.test(decoded)) {
       text += "\n\n⚠️ Only open links from sources you trust.";
     }
-    await ctx.reply(text);
+    await ctx.reply(
+      text,
+      Markup.inlineKeyboard([[Markup.button.callback("🔁 Make a new QR", "go:home")]])
+    );
   } catch (error) {
     console.error("QR scan failed:", error);
     await ctx.reply("Sorry, I couldn't read that image.");
@@ -791,10 +1067,17 @@ async function saveLogo(ctx, fileId) {
     getSettings(ctx.from.id).logo = logo;
     await saveSettings(ctx.from.id);
     logActivity(ctx.from.id, "logo_set");
+
+    const plan = await getPlan(ctx.from.id);
+    const trialLine = plan.pro
+      ? ""
+      : `\n\n🎁 Free logo trials left: ${trialsLeft(plan, "logo")} of ${TRIALS.logo}. One is used for each QR code with a logo.`;
     await ctx.reply(
-      "✅ Logo saved. It will appear in the centre of your next QR codes.\n\n" +
-        "Error correction is set to High automatically so the code still scans. " +
-        "Send /removelogo to remove it."
+      "✅ Logo saved. It goes in the centre of your next QR codes. Accuracy is set to High automatically." + trialLine,
+      Markup.inlineKeyboard([
+        [Markup.button.callback("🎨 Style", "go:style"), Markup.button.callback("🗑️ Remove logo", "style:rmlogo")],
+        [Markup.button.callback("🏠 Home", "go:home")],
+      ])
     );
   } catch (error) {
     console.error("Logo upload failed:", error);
@@ -826,7 +1109,6 @@ const linkStep = (key, prompt, extra = {}) => ({
   ...extra,
 });
 
-// Simple "paste a link" flow used by /menu, /portfolio and /review
 const linkFlow = (title, prompt, label) => ({
   title,
   steps: [linkStep("url", prompt)],
@@ -838,10 +1120,9 @@ const buildSocial = (d) =>
   /^https?:\/\//i.test(d.handle) ? d.handle : SOCIALS[d.platform].url(d.handle);
 
 const FLOW_DEFS = {
-  // ----- Small businesses -----
   menu: linkFlow(
     "Your menu QR code is ready! 🍽️",
-    "🍽️ Paste the link to your menu (website, PDF, Google Drive, Instagram, etc.):",
+    "🍽️ Paste your menu link (website, PDF, Drive, Instagram...):",
     "🍽️ Menu"
   ),
 
@@ -852,12 +1133,12 @@ const FLOW_DEFS = {
         key: "kind",
         prompt: "💳 What should customers scan to pay?",
         buttons: [
-          ["💳 Payment link (Paystack, Flutterwave, PayPal...)", "link"],
-          ["🏦 Bank transfer details", "bank"],
+          ["💳 Payment link", "link"],
+          ["🏦 Bank transfer", "bank"],
         ],
         validate: (v) => (["link", "bank"].includes(v) ? null : "Please tap one of the buttons above."),
       },
-      linkStep("link", "🔗 Paste your payment link:", { skip: (d) => d.kind !== "link" }),
+      linkStep("link", "🔗 Paste your payment link (Paystack, Flutterwave, PayPal...):", { skip: (d) => d.kind !== "link" }),
       {
         key: "accname",
         prompt: "👤 Account name?",
@@ -932,7 +1213,6 @@ const FLOW_DEFS = {
     "⭐ Review page"
   ),
 
-  // ----- Creators and freelancers -----
   social: {
     title: "Your social QR code is ready! 📱",
     steps: [
@@ -963,7 +1243,6 @@ const FLOW_DEFS = {
     "🎨 Portfolio"
   ),
 
-  // ----- Everyone -----
   wifi: {
     title: "Your Wi-Fi QR code is ready! 📶",
     steps: [
@@ -993,7 +1272,6 @@ const FLOW_DEFS = {
       d.security === "nopass"
         ? `WIFI:T:nopass;S:${wifiEscape(d.ssid)};;`
         : `WIFI:T:${d.security};S:${wifiEscape(d.ssid)};P:${wifiEscape(d.password)};;`,
-    // The password is deliberately not echoed back in the caption (or saved in the history summary)
     summary: (d) => `Network: ${d.ssid}\nSecurity: ${d.security === "nopass" ? "Open" : d.security}\n\nScan to join the network.`,
   },
 
@@ -1057,14 +1335,26 @@ const FLOW_DEFS = {
       [`To: ${d.number}`, d.message && `Message: ${clip(d.message, 200)}`].filter(Boolean).join("\n"),
   },
 
-  // ----- Designers and marketers -----
+  text: {
+    steps: [
+      {
+        key: "text",
+        prompt: "📝 Send the exact text to encode. Links, emails and numbers stay as typed.",
+        validate: (v) =>
+          !v ? "Please send some text." : v.length <= MAX_TEXT_LENGTH ? null : `Please keep it under ${MAX_TEXT_LENGTH} characters.`,
+      },
+    ],
+    build: (d) => d.text,
+    summary: (d) => `📝 Text\n${clip(d.text)}`,
+  },
+
   bulk: {
     steps: [
       {
         key: "items",
         prompt:
-          `📦 Send up to ${MAX_BULK_ITEMS} items, one per line (links, text, phone numbers...). ` +
-          "I'll send each one back as an HD PNG file, using your /style settings.",
+          `📦 Send up to ${MAX_BULK_ITEMS} items, one per line (links, text, numbers...).\n` +
+          "You'll get each one back as an HD PNG, using your /style.",
         validate: (v) => {
           const lines = v.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
           if (!lines.length) return "Please send at least one line.";
@@ -1091,7 +1381,15 @@ function getFlow(userId) {
 }
 
 async function startFlow(ctx, type) {
-  awaitingLogo.delete(ctx.from.id);
+  clearPending(ctx.from.id);
+
+  // Check bulk access up front so people don't type ten lines and then hit a paywall
+  if (type === "bulk") {
+    const access = await checkBulkAccess(ctx);
+    if (!access.ok) return;
+    if (!access.pro) await ctx.reply(`🎁 Free bulk trials left: ${access.left} of ${TRIALS.bulk}.`);
+  }
+
   flows.set(ctx.from.id, { type, index: 0, data: {}, expires: Date.now() + FLOW_TTL_MS });
   return askNext(ctx);
 }
@@ -1101,7 +1399,6 @@ async function askNext(ctx) {
   if (!flow) return;
   const def = FLOW_DEFS[flow.type];
 
-  // Skip steps that don't apply (e.g. no password for an open network)
   while (flow.index < def.steps.length && def.steps[flow.index].skip && def.steps[flow.index].skip(flow.data)) {
     flow.data[def.steps[flow.index].key] = "";
     flow.index++;
@@ -1118,20 +1415,19 @@ async function askNext(ctx) {
   }
 
   const step = def.steps[flow.index];
-  let text = step.prompt;
-  if (step.optional) text += "\n\nOptional: send /skip to leave this blank.";
-  text += "\nSend /cancel to stop.";
-
-  const keyboard = step.buttons
-    ? Markup.inlineKeyboard(
-        chunk(
-          step.buttons.map(([label, value]) => Markup.button.callback(label, `flow:${value}`)),
-          step.columns || 1
-        )
+  const rows = step.buttons
+    ? chunk(
+        step.buttons.map(([label, value]) => Markup.button.callback(label, `flow:${value}`)),
+        step.columns || 1
       )
-    : undefined;
+    : [];
 
-  return ctx.reply(text, keyboard);
+  const controls = [];
+  if (step.optional) controls.push(Markup.button.callback("⏭️ Skip", "fl:skip"));
+  controls.push(Markup.button.callback("✖️ Cancel", "fl:cancel"));
+  rows.push(controls);
+
+  return ctx.reply(step.prompt, Markup.inlineKeyboard(rows));
 }
 
 async function acceptFlowValue(ctx, rawValue) {
@@ -1153,14 +1449,100 @@ async function acceptFlowValue(ctx, rawValue) {
   return true;
 }
 
+async function skipStep(ctx) {
+  const flow = getFlow(ctx.from.id);
+  if (!flow) return ctx.reply("Nothing to skip right now.", homeButton());
+
+  const step = FLOW_DEFS[flow.type].steps[flow.index];
+  if (!step.optional) return ctx.reply("This step is required. Please send a value, or tap Cancel.");
+
+  flow.data[step.key] = "";
+  flow.index++;
+  flow.expires = Date.now() + FLOW_TTL_MS;
+  return askNext(ctx);
+}
+
+async function removeButtons(ctx) {
+  try {
+    await ctx.editMessageReplyMarkup(undefined);
+  } catch (_) {
+    /* message may already be edited, ignore */
+  }
+}
+
 // ---------------------------------------------------------------------------
-// Style settings
+// Home menu
 // ---------------------------------------------------------------------------
-function styleView(settings) {
+const HOME_BUTTONS = [
+  ["🍽️ Menu", "menu"],
+  ["💳 Pay", "pay"],
+  ["💬 WhatsApp", "whatsapp"],
+  ["🛍️ Product", "product"],
+  ["⭐ Review", "review"],
+  ["📱 Social", "social"],
+  ["🎨 Portfolio", "portfolio"],
+  ["👤 Contact", "contact"],
+  ["📶 Wi-Fi", "wifi"],
+  ["✉️ Email", "email"],
+  ["📩 SMS", "sms"],
+  ["📍 Location", "location"],
+  ["📝 Text", "text"],
+  ["📦 Bulk", "bulk"],
+];
+
+function homeKeyboard() {
+  const rows = chunk(
+    HOME_BUTTONS.map(([label, id]) => Markup.button.callback(label, `go:${id}`)),
+    3
+  );
+  rows.push([
+    Markup.button.callback("🎨 Style", "go:style"),
+    Markup.button.callback("📜 History", "go:history"),
+    Markup.button.callback("🖨️ Print", "go:print"),
+  ]);
+  rows.push([
+    Markup.button.callback("📊 My plan", "go:plan"),
+    Markup.button.callback("❤️ Donate", "go:donate"),
+    Markup.button.callback("❓ Help", "go:help"),
+  ]);
+  return Markup.inlineKeyboard(rows);
+}
+
+const HOME_TEXT =
+  "👋 Quick QR Generator\n\n" +
+  "Send me a link, text, email or phone number, or tap a button.\n" +
+  "📷 Send a photo of a QR code to scan it.";
+
+const sendHome = (ctx) => ctx.reply(HOME_TEXT, homeKeyboard());
+
+const HELP_TEXT =
+  "🤖 Quick QR Generator\n\n" +
+  "Send a link, text, email or number to get a QR code.\n\n" +
+  "🏪 Business\n" +
+  "/menu /pay /whatsapp /product /review /contact\n\n" +
+  "🎨 Design\n" +
+  "/colors /logo /style /bulk\n\n" +
+  "📱 Creators\n" +
+  "/social /portfolio /whatsapp /contact\n\n" +
+  "Also\n" +
+  "/wifi /email /sms /location /text\n\n" +
+  "📜 Your stuff\n" +
+  "/history /print /activity /plan\n" +
+  "/clearhistory /deletedata\n\n" +
+  "📷 Send a photo to scan a QR code.\n" +
+  "/donate to support the bot ❤️";
+
+const sendHelp = (ctx) => ctx.reply(HELP_TEXT, homeKeyboard());
+
+// ---------------------------------------------------------------------------
+// Style settings and colour picker
+// ---------------------------------------------------------------------------
+async function styleView(userId) {
+  const settings = getSettings(userId);
+  const plan = await getPlan(userId);
   const mark = (active) => (active ? "✅ " : "");
 
-  const themeEntries = Object.entries(THEMES);
-  const themeButtons = themeEntries.map(([id, t]) =>
+  const themeButtons = Object.entries(THEMES).map(([id, t]) =>
     Markup.button.callback(`${mark(settings.theme === id)}${t.emoji} ${t.name}`, `style:theme:${id}`)
   );
   if (settings.custom) {
@@ -1172,36 +1554,149 @@ function styleView(settings) {
   const eclButtons = Object.keys(ECLS).map((id) =>
     Markup.button.callback(`${mark(settings.ecl === id)}${id}`, `style:ecl:${id}`)
   );
-  const toggleButton = Markup.button.callback(
-    `${settings.transparent ? "✅" : "⬜"} Transparent background`,
-    "style:transparent"
-  );
 
   const theme = resolveTheme(settings);
-  const colourLine = settings.theme === "custom" ? `Custom (${theme.dark} on ${theme.light})` : theme.name;
+  const colourLine = settings.theme === "custom" ? `${swatchName(CODE_COLORS, theme.dark)} on ${swatchName(BG_COLORS, theme.light)}` : theme.name;
+  const logoLine = settings.logo
+    ? plan.pro
+      ? "On"
+      : `On (trials left: ${trialsLeft(plan, "logo")}/${TRIALS.logo})`
+    : "Off";
 
   const text =
     "🎨 QR style\n\n" +
     `Colour: ${colourLine}\n` +
     `Size: ${SIZES[settings.size].name} (${SIZES[settings.size].px}px)\n` +
-    `Error correction: ${settings.logo ? "H, forced by your logo" : `${settings.ecl}, ${ECLS[settings.ecl]}`}\n` +
+    `Accuracy: ${settings.logo ? "H (logo)" : settings.ecl}\n` +
     `Background: ${settings.transparent ? "Transparent" : "Solid"}\n` +
-    `Logo: ${settings.logo ? "Added (/removelogo to remove)" : "None (/logo to add)"}\n\n` +
-    "Tap to change. Applies to your next QR codes. Your style is saved.\n" +
-    "Brand colours: /colors #hex #hex\n" +
-    "Tip: transparent PNGs arrive as files so the background stays clear for flyers and posters.";
+    `Logo: ${logoLine}\n\n` +
+    "Tap to change. Saved automatically.";
 
-  const keyboard = Markup.inlineKeyboard([...chunk(themeButtons, 3), sizeButtons, eclButtons, [toggleButton]]);
+  const logoRow = settings.logo
+    ? [Markup.button.callback("🖼️ Change logo", "style:logo"), Markup.button.callback("🗑️ Remove logo", "style:rmlogo")]
+    : [Markup.button.callback("🖼️ Add logo", "style:logo")];
+
+  const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback("▼ Colour", "noop")],
+    ...chunk(themeButtons, 3),
+    [Markup.button.callback("🎨 Pick custom colours", "go:colors")],
+    [Markup.button.callback("▼ Size", "noop")],
+    sizeButtons,
+    [Markup.button.callback("▼ Accuracy", "noop")],
+    eclButtons,
+    [Markup.button.callback(`${settings.transparent ? "✅" : "⬜"} Transparent background`, "style:transparent")],
+    logoRow,
+    [Markup.button.callback("👁️ Preview", "style:preview"), Markup.button.callback("🏠 Home", "go:home")],
+  ]);
   return { text, keyboard };
 }
 
-async function refreshStyle(ctx, settings) {
-  const { text, keyboard } = styleView(settings);
+async function showStyle(ctx) {
+  const { text, keyboard } = await styleView(ctx.from.id);
+  return ctx.reply(text, keyboard);
+}
+
+async function refreshStyle(ctx) {
+  const { text, keyboard } = await styleView(ctx.from.id);
   try {
     await ctx.editMessageText(text, keyboard);
   } catch (error) {
     if (!/not modified/i.test(String(error && error.message))) throw error;
   }
+}
+
+function colourView(settings) {
+  const theme = resolveTheme(settings);
+  const mark = (active) => (active ? "✅" : "");
+
+  const codeButtons = CODE_COLORS.map((c) =>
+    Markup.button.callback(`${mark(theme.dark === c.hex)}${c.e}`, `col:d:${c.hex.slice(1)}`)
+  );
+  const bgButtons = BG_COLORS.map((c) =>
+    Markup.button.callback(`${mark(theme.light === c.hex)}${c.e}`, `col:l:${c.hex.slice(1)}`)
+  );
+
+  const text =
+    "🎨 Pick your colours\n\n" +
+    `Code: ${swatchName(CODE_COLORS, theme.dark)}\n` +
+    `Background: ${swatchName(BG_COLORS, theme.light)}\n\n` +
+    "Tap a swatch. I check the contrast so your code still scans.";
+
+  const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback("▼ Code colour", "noop")],
+    ...chunk(codeButtons, 4),
+    [Markup.button.callback("▼ Background", "noop")],
+    ...chunk(bgButtons, 4),
+    [Markup.button.callback("⌨️ Type hex", "col:type"), Markup.button.callback("👁️ Preview", "style:preview")],
+    [Markup.button.callback("◀️ Back to style", "go:style")],
+  ]);
+  return { text, keyboard };
+}
+
+const showColours = (ctx) => {
+  const { text, keyboard } = colourView(getSettings(ctx.from.id));
+  return ctx.reply(text, keyboard);
+};
+
+async function refreshColours(ctx) {
+  const { text, keyboard } = colourView(getSettings(ctx.from.id));
+  try {
+    await ctx.editMessageText(text, keyboard);
+  } catch (error) {
+    if (!/not modified/i.test(String(error && error.message))) throw error;
+  }
+}
+
+// Used by /colors #hex #hex and by the "Type hex" button
+async function applyColors(ctx, args) {
+  const dark = normalizeHex(args[0]);
+  const light = args[1] ? normalizeHex(args[1]) : "#ffffff";
+  if (!dark || !light) {
+    return ctx.reply("Colours must be 6-digit hex codes like #1d4ed8.");
+  }
+
+  const ratio = contrastRatio(dark, light);
+  if (ratio < 3) {
+    return ctx.reply(
+      `Those colours are too close (contrast ${ratio.toFixed(1)}:1) and many phones won't scan the code. ` +
+        "Try a darker code colour or a lighter background."
+    );
+  }
+
+  const settings = getSettings(ctx.from.id);
+  settings.custom = { dark, light };
+  settings.theme = "custom";
+  await saveSettings(ctx.from.id);
+  logActivity(ctx.from.id, "colors_set", { dark, light });
+
+  let reply = `✅ Colours saved: ${dark} on ${light}.`;
+  if (luminance(dark) > luminance(light)) {
+    reply += "\n\n⚠️ Your code is lighter than its background. Some older scanners can't read inverted codes, so test it first.";
+  }
+  return ctx.reply(
+    reply,
+    Markup.inlineKeyboard([
+      [Markup.button.callback("🎨 Colours", "go:colors"), Markup.button.callback("⚙️ Style", "go:style")],
+      [Markup.button.callback("🏠 Home", "go:home")],
+    ])
+  );
+}
+
+async function askLogo(ctx) {
+  flows.delete(ctx.from.id);
+  awaitingHex.delete(ctx.from.id);
+  awaitingLogo.set(ctx.from.id, Date.now() + FLOW_TTL_MS);
+
+  const plan = await getPlan(ctx.from.id);
+  const trialLine = plan.pro
+    ? ""
+    : `\n\n🎁 Free logo trials: ${trialsLeft(plan, "logo")} of ${TRIALS.logo} left.`;
+  return ctx.reply(
+    "🖼️ Send your logo as an image.\n\n" +
+      "A square PNG sent as a file looks best. It sits in the centre of your QR codes." +
+      trialLine,
+    Markup.inlineKeyboard([[Markup.button.callback("✖️ Cancel", "fl:cancel")]])
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1214,8 +1709,8 @@ async function historyView(userId, requestedPage) {
   const total = await countHistory(userId);
   if (!total) {
     return {
-      text: "📜 Your history is empty.\n\nEvery QR code you create is saved here so you can reopen, download or print it later.",
-      keyboard: undefined,
+      text: "📜 Your history is empty.\n\nEvery QR code you create is saved here.",
+      keyboard: Markup.inlineKeyboard([[Markup.button.callback("➕ Make a QR code", "go:home")]]),
     };
   }
 
@@ -1228,25 +1723,46 @@ async function historyView(userId, requestedPage) {
   if (page > 0) nav.push(Markup.button.callback("◀️ Newer", `hist:${page - 1}`));
   if (page < pages - 1) nav.push(Markup.button.callback("Older ▶️", `hist:${page + 1}`));
   if (nav.length) buttons.push(nav);
+  buttons.push([Markup.button.callback("🖨️ Print latest", "go:print"), Markup.button.callback("🏠 Home", "go:home")]);
 
   const text =
-    `📜 Your history: ${total} QR code${total === 1 ? "" : "s"} (page ${page + 1} of ${pages})\n\n` +
-    "Tap one to open it again with download and print buttons.\n" +
-    "Search with /history keyword, e.g. /history menu";
+    `📜 History: ${total} QR code${total === 1 ? "" : "s"} (page ${page + 1}/${pages})\n\n` +
+    "Tap one to reopen it.\n" +
+    "Search: /history keyword";
 
   return { text, keyboard: Markup.inlineKeyboard(buttons) };
+}
+
+async function showHistory(ctx) {
+  const { text, keyboard } = await historyView(ctx.from.id, 0);
+  return ctx.reply(text, keyboard);
 }
 
 function printKeyboard(id) {
   return Markup.inlineKeyboard([
     [Markup.button.callback("📄 Single A4 poster", `prm:single:${id}`)],
-    [Markup.button.callback("🏷️ Sheet of 6 (table cards, stickers)", `prm:sheet6:${id}`)],
-    [Markup.button.callback("🏷️ Sheet of 12 (small labels)", `prm:sheet12:${id}`)],
+    [Markup.button.callback("🏷️ Sheet of 6", `prm:sheet6:${id}`), Markup.button.callback("🏷️ Sheet of 12", `prm:sheet12:${id}`)],
+    [Markup.button.callback("🏠 Home", "go:home")],
   ]);
 }
 
 function printPrompt() {
-  return "🖨️ Choose a print layout. You'll get an A4 PDF at print quality.";
+  return "🖨️ Choose a print layout (A4 PDF).\n\nSheet of 6: table cards, stickers.\nSheet of 12: small labels.";
+}
+
+async function showPrint(ctx) {
+  const [latest] = await listHistory(ctx.from.id, 1, 0);
+  if (!latest) {
+    return ctx.reply(
+      "You don't have any saved QR codes yet. Create one first.",
+      Markup.inlineKeyboard([[Markup.button.callback("➕ Make a QR code", "go:home")]])
+    );
+  }
+  return ctx.reply(
+    `${printPrompt()}\n\nLatest QR: ${kindEmoji(latest.kind)} ${fmtDate(latest.created_at)}\n` +
+      "For an older one, open it from History and tap Print.",
+    printKeyboard(latest.id)
+  );
 }
 
 function describeActivity(row) {
@@ -1278,11 +1794,32 @@ function describeActivity(row) {
       return "Saved brand colours";
     case "history_cleared":
       return "Cleared history";
+    case "history_viewed":
+      return "Viewed history";
     case "donation":
       return `Donated ${d.amount} Stars`;
+    case "pro_purchased":
+      return `Bought Pro (${d.days} days)`;
     default:
       return row.action;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Donations and Pro (Telegram Stars)
+// ---------------------------------------------------------------------------
+const DONATE_LINK = process.env.DONATE_LINK;
+const STAR_AMOUNTS = [25, 50, 100, 250];
+
+function showDonate(ctx) {
+  const rows = [STAR_AMOUNTS.map((n) => Markup.button.callback(`⭐ ${n}`, `donate:${n}`))];
+  if (DONATE_LINK) rows.push([Markup.button.url("💳 Card or bank transfer", DONATE_LINK)]);
+  rows.push([Markup.button.callback("⭐ Get Pro instead", "buy:pro"), Markup.button.callback("🏠 Home", "go:home")]);
+
+  return ctx.reply(
+    "❤️ Quick QR Generator is free to use. Donations help cover running costs.\n\nPick an amount in Telegram Stars:",
+    Markup.inlineKeyboard(rows)
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1313,7 +1850,6 @@ bot.use(async (ctx, next) => {
       const command = text && /^\/(\w+)/.exec(text);
       if (command) logActivity(user.id, "command", { command: command[1].toLowerCase() });
     } catch (error) {
-      // A database problem should degrade features, not stop the bot
       console.error("User sync failed:", error.message);
     }
   }
@@ -1323,183 +1859,77 @@ bot.use(async (ctx, next) => {
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
-const HELP_TEXT =
-  "🤖 Quick QR Generator\n\n" +
-  "Send me text, a link, an email address or a phone number and I'll turn it into a QR code.\n\n" +
-  "🏪 For businesses:\n" +
-  "/menu - Link to your menu\n" +
-  "/pay - Payment link or bank details\n" +
-  "/whatsapp - Click-to-chat with a pre-filled message\n" +
-  "/product - Product name, price and details\n" +
-  "/review - Google review link\n" +
-  "/contact - Contact card (vCard)\n\n" +
-  "🎨 For designers and marketers:\n" +
-  "/colors - Brand colours, e.g. /colors #1d4ed8 #ffffff\n" +
-  "/logo - Put your logo in the centre\n" +
-  "/style - Colour, size (up to 3000px), transparent background\n" +
-  "/bulk - Up to 10 QR codes in one go\n\n" +
-  "📱 For creators and freelancers:\n" +
-  "/social - Instagram, TikTok, X, YouTube, LinkedIn and more\n" +
-  "/portfolio - Portfolio or website link\n" +
-  "/whatsapp - Let clients message you instantly\n" +
-  "/contact - Share your details in one scan\n\n" +
-  "📜 History and printing:\n" +
-  "/history - Browse your past QR codes (or /history keyword to search)\n" +
-  "/print - Print-ready A4 PDF of your latest QR code\n" +
-  "/activity - Your recent activity\n" +
-  "/clearhistory - Delete your saved QR history\n" +
-  "/deletedata - Delete everything stored about you\n\n" +
-  "Also:\n" +
-  "/wifi - Wi-Fi network (scan to join)\n" +
-  "/email - Pre-filled email\n" +
-  "/sms - Pre-filled text message\n" +
-  "/location - Share a location as a QR code\n" +
-  "/text - Encode text exactly as typed\n" +
-  "📷 Send me a photo of a QR code and I'll read it.\n" +
-  "/cancel - Stop the current setup\n" +
-  "/donate - Support this bot ❤️\n\n" +
-  "Every QR code comes with buttons to download an HD PNG or SVG, or print it.";
-
-bot.start((ctx) =>
-  ctx.reply(
-    "Welcome to Quick QR Generator! 👋\n\n" +
-      "Send me any text, URL, email address or phone number and I'll generate a QR code for you.\n\n" +
-      "Running a business? Try /menu, /pay or /whatsapp.\n" +
-      "Designer or marketer? Try /colors, /logo or /bulk.\n" +
-      "Creator or freelancer? Try /social or /portfolio.\n\n" +
-      "Your QR codes are saved in /history so you can reopen or print them anytime.\n" +
-      "You can also send me a photo of a QR code to scan it. Send /help to see everything I can do."
-  )
-);
-
-bot.help((ctx) => ctx.reply(HELP_TEXT));
+bot.start((ctx) => sendHome(ctx));
+bot.help((ctx) => sendHelp(ctx));
 
 // Every guided flow gets a command with the same name (/wifi, /menu, /pay, ...)
 for (const type of Object.keys(FLOW_DEFS)) {
+  if (type === "text") continue; // /text has its own handler so it can take the text inline
   bot.command(type, (ctx) => startFlow(ctx, type));
 }
 
-bot.command("location", (ctx) =>
-  ctx.reply("📍 Tap the 📎 attachment button, choose Location, and send me a location. I'll turn it into a QR code that opens in maps.")
-);
-
 bot.command("text", async (ctx) => {
   const raw = ctx.message.text.replace(/^\/text(@\w+)?\s*/i, "").trim();
-  if (!raw) {
-    return ctx.reply("Send it like this:\n/text your exact text here\n\nI'll encode it without turning links, emails or numbers into special formats.");
-  }
+  if (!raw) return startFlow(ctx, "text");
   return sendQR(ctx, raw, { summary: `📝 Text\n${clip(raw)}`, kind: "text" });
 });
 
+const LOCATION_HELP =
+  "📍 Tap the 📎 attachment button, choose Location, and send it. I'll turn it into a QR code that opens in maps.";
+
+bot.command("location", (ctx) => ctx.reply(LOCATION_HELP, homeButton()));
+
 bot.command(["colors", "colours"], async (ctx) => {
   const args = ctx.message.text.split(/\s+/).slice(1).filter(Boolean);
-  if (!args.length) {
-    return ctx.reply(
-      "🎨 Set your brand colours with hex codes:\n\n" +
-        "/colors #1d4ed8 #ffffff\n\n" +
-        "The first is the code colour, the second is the background (optional, defaults to white). " +
-        "Dark on light scans best."
-    );
-  }
-
-  const dark = normalizeHex(args[0]);
-  const light = args[1] ? normalizeHex(args[1]) : "#ffffff";
-  if (!dark || !light) {
-    return ctx.reply("Colours must be 6-digit hex codes like #1d4ed8.");
-  }
-
-  const ratio = contrastRatio(dark, light);
-  if (ratio < 3) {
-    return ctx.reply(
-      `Those colours are too close together (contrast ${ratio.toFixed(1)}:1) and many phones won't scan the code. ` +
-        "Try a darker code colour or a lighter background."
-    );
-  }
-
-  const settings = getSettings(ctx.from.id);
-  settings.custom = { dark, light };
-  settings.theme = "custom";
-  await saveSettings(ctx.from.id);
-  logActivity(ctx.from.id, "colors_set", { dark, light });
-
-  let reply = `✅ Brand colours saved: ${dark} on ${light}. They apply to your next QR codes.`;
-  if (luminance(dark) > luminance(light)) {
-    reply += "\n\n⚠️ Your code is lighter than its background. Some older scanners can't read inverted codes, so test it first.";
-  }
-  return ctx.reply(reply);
+  if (!args.length) return showColours(ctx);
+  return applyColors(ctx, args);
 });
 
-bot.command("logo", (ctx) => {
-  flows.delete(ctx.from.id);
-  awaitingLogo.set(ctx.from.id, Date.now() + FLOW_TTL_MS);
-  return ctx.reply(
-    "🖼️ Send me your logo as an image. A square PNG sent as a file (not a compressed photo) looks best.\n\n" +
-      "It will sit in the centre of your QR codes, and error correction switches to High automatically.\n" +
-      "Send /cancel to stop."
-  );
-});
+bot.command("logo", (ctx) => askLogo(ctx));
 
 bot.command("removelogo", async (ctx) => {
   const settings = getSettings(ctx.from.id);
-  if (!settings.logo) return ctx.reply("You don't have a logo saved.");
+  if (!settings.logo) return ctx.reply("You don't have a logo saved.", homeButton());
   settings.logo = null;
   await saveSettings(ctx.from.id);
   logActivity(ctx.from.id, "logo_removed");
-  return ctx.reply("Logo removed.");
+  return ctx.reply("Logo removed.", homeButton());
 });
 
-bot.command("style", (ctx) => {
-  const { text, keyboard } = styleView(getSettings(ctx.from.id));
+bot.command("style", (ctx) => showStyle(ctx));
+
+bot.command(["plan", "pro"], async (ctx) => {
+  const { text, keyboard } = await planView(ctx.from.id);
   return ctx.reply(text, keyboard);
 });
 
 bot.command("cancel", (ctx) => {
-  const hadFlow = flows.delete(ctx.from.id);
-  const hadLogo = awaitingLogo.delete(ctx.from.id);
-  if (hadFlow || hadLogo) return ctx.reply("Cancelled. Send me anything to make a QR code.");
-  return ctx.reply("Nothing to cancel right now.");
+  if (clearPending(ctx.from.id)) return ctx.reply("Cancelled.", homeButton());
+  return ctx.reply("Nothing to cancel right now.", homeButton());
 });
 
-bot.command("skip", async (ctx) => {
-  const flow = getFlow(ctx.from.id);
-  if (!flow) return ctx.reply("Nothing to skip right now.");
+bot.command("skip", (ctx) => skipStep(ctx));
 
-  const step = FLOW_DEFS[flow.type].steps[flow.index];
-  if (!step.optional) return ctx.reply("This step is required. Please send a value, or /cancel to stop.");
-
-  flow.data[step.key] = "";
-  flow.index++;
-  flow.expires = Date.now() + FLOW_TTL_MS;
-  return askNext(ctx);
-});
-
-// ----- History, print, activity, privacy -----
 bot.command("history", async (ctx) => {
   const term = ctx.message.text.replace(/^\/history(@\w+)?\s*/i, "").trim();
 
   if (term) {
     const rows = await searchHistory(ctx.from.id, term.slice(0, 50), SEARCH_LIMIT);
-    if (!rows.length) return ctx.reply(`No saved QR codes match "${clip(term, 50)}".`);
+    if (!rows.length) {
+      return ctx.reply(`No saved QR codes match "${clip(term, 50)}".`, Markup.inlineKeyboard([[Markup.button.callback("📜 All history", "hist:0")]]));
+    }
     const buttons = rows.map((row) => [Markup.button.callback(historyButtonLabel(row), `h:open:${row.id}`)]);
+    buttons.push([Markup.button.callback("📜 All history", "hist:0"), Markup.button.callback("🏠 Home", "go:home")]);
     return ctx.reply(
-      `🔎 ${rows.length} result${rows.length === 1 ? "" : "s"} for "${clip(term, 50)}". Tap one to open it:`,
+      `🔎 ${rows.length} result${rows.length === 1 ? "" : "s"} for "${clip(term, 50)}". Tap one:`,
       Markup.inlineKeyboard(buttons)
     );
   }
 
-  const { text, keyboard } = await historyView(ctx.from.id, 0);
-  return ctx.reply(text, keyboard);
+  return showHistory(ctx);
 });
 
-bot.command("print", async (ctx) => {
-  const [latest] = await listHistory(ctx.from.id, 1, 0);
-  if (!latest) return ctx.reply("You don't have any saved QR codes yet. Create one first, then use /print.");
-  return ctx.reply(
-    `${printPrompt()}\n\nLatest QR code: ${kindEmoji(latest.kind)} ${fmtDate(latest.created_at)}\n` +
-      "To print an older one, open it from /history and tap Print.",
-    printKeyboard(latest.id)
-  );
-});
+bot.command("print", (ctx) => showPrint(ctx));
 
 bot.command("activity", async (ctx) => {
   const { rows } = await pool.query(
@@ -1508,47 +1938,96 @@ bot.command("activity", async (ctx) => {
      ORDER BY id DESC LIMIT $2`,
     [ctx.from.id, ACTIVITY_LIMIT]
   );
-  if (!rows.length) return ctx.reply("No activity recorded yet.");
+  if (!rows.length) return ctx.reply("No activity recorded yet.", homeButton());
   const lines = rows.map((row) => `${fmtDate(row.created_at)} · ${describeActivity(row)}`);
-  return ctx.reply(`🕑 Your last ${rows.length} actions:\n\n${lines.join("\n")}`);
+  return ctx.reply(`🕑 Your last ${rows.length} actions:\n\n${lines.join("\n")}`, homeButton());
 });
 
 bot.command("clearhistory", async (ctx) => {
   const total = await countHistory(ctx.from.id);
-  if (!total) return ctx.reply("Your history is already empty.");
+  if (!total) return ctx.reply("Your history is already empty.", homeButton());
   return ctx.reply(
-    `Delete all ${total} saved QR code${total === 1 ? "" : "s"} from your history? This can't be undone.`,
+    `Delete all ${total} saved QR code${total === 1 ? "" : "s"}? This can't be undone.`,
     Markup.inlineKeyboard([
-      [Markup.button.callback("🗑️ Yes, delete history", "h:clearyes"), Markup.button.callback("Keep it", "h:no")],
+      [Markup.button.callback("🗑️ Yes, delete", "h:clearyes"), Markup.button.callback("Keep it", "h:no")],
     ])
   );
 });
 
 bot.command("deletedata", (ctx) =>
   ctx.reply(
-    "This permanently deletes everything stored about you: your QR history, activity log, saved style and logo. This can't be undone.",
+    "This permanently deletes your QR history, activity log, saved style and logo.\n\n" +
+      "Your Pro status and daily/trial counters are kept.",
     Markup.inlineKeyboard([
       [Markup.button.callback("⚠️ Delete everything", "h:wipeyes"), Markup.button.callback("Cancel", "h:no")],
     ])
   )
 );
 
+bot.command("donate", (ctx) => showDonate(ctx));
+
 // ---------------------------------------------------------------------------
 // Button callbacks
 // ---------------------------------------------------------------------------
+bot.action("noop", (ctx) => ctx.answerCbQuery());
+
+// Home menu and shortcuts
+bot.action(/^go:(\w+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const target = ctx.match[1];
+
+  if (Object.prototype.hasOwnProperty.call(FLOW_DEFS, target)) return startFlow(ctx, target);
+
+  switch (target) {
+    case "home":
+      return sendHome(ctx);
+    case "help":
+      return sendHelp(ctx);
+    case "style":
+      return showStyle(ctx);
+    case "colors":
+      return showColours(ctx);
+    case "history":
+      return showHistory(ctx);
+    case "print":
+      return showPrint(ctx);
+    case "donate":
+      return showDonate(ctx);
+    case "location":
+      return ctx.reply(LOCATION_HELP, homeButton());
+    case "plan": {
+      const { text, keyboard } = await planView(ctx.from.id);
+      return ctx.reply(text, keyboard);
+    }
+    default:
+      return;
+  }
+});
+
+// Flow buttons
 bot.action(/^flow:(.+)$/, async (ctx) => {
   await ctx.answerCbQuery();
   if (!getFlow(ctx.from.id)) {
-    return ctx.reply("That setup has expired. Please start again.");
+    return ctx.reply("That setup has expired.", Markup.inlineKeyboard([[Markup.button.callback("🏠 Start again", "go:home")]]));
   }
-  try {
-    await ctx.editMessageReplyMarkup(undefined); // remove the buttons once used
-  } catch (_) {
-    /* message may already be edited, ignore */
-  }
+  await removeButtons(ctx);
   return acceptFlowValue(ctx, ctx.match[1]);
 });
 
+bot.action("fl:skip", async (ctx) => {
+  await ctx.answerCbQuery();
+  await removeButtons(ctx);
+  return skipStep(ctx);
+});
+
+bot.action("fl:cancel", async (ctx) => {
+  await ctx.answerCbQuery("Cancelled");
+  await removeButtons(ctx);
+  clearPending(ctx.from.id);
+  return ctx.reply("Cancelled.", homeButton());
+});
+
+// Style
 bot.action(/^style:(theme|size|ecl):(\w+)$/, async (ctx) => {
   const [, kind, value] = ctx.match;
   const settings = getSettings(ctx.from.id);
@@ -1564,7 +2043,7 @@ bot.action(/^style:(theme|size|ecl):(\w+)$/, async (ctx) => {
   await saveSettings(ctx.from.id);
   logActivity(ctx.from.id, "style_changed", { setting: kind, value });
   await ctx.answerCbQuery("Saved ✅");
-  await refreshStyle(ctx, settings);
+  await refreshStyle(ctx);
 });
 
 bot.action("style:transparent", async (ctx) => {
@@ -1573,7 +2052,91 @@ bot.action("style:transparent", async (ctx) => {
   await saveSettings(ctx.from.id);
   logActivity(ctx.from.id, "style_changed", { setting: "transparent", value: settings.transparent });
   await ctx.answerCbQuery("Saved ✅");
-  await refreshStyle(ctx, settings);
+  await refreshStyle(ctx);
+});
+
+bot.action("style:logo", async (ctx) => {
+  await ctx.answerCbQuery();
+  return askLogo(ctx);
+});
+
+bot.action("style:rmlogo", async (ctx) => {
+  const settings = getSettings(ctx.from.id);
+  if (!settings.logo) return ctx.answerCbQuery("No logo to remove.");
+  settings.logo = null;
+  await saveSettings(ctx.from.id);
+  logActivity(ctx.from.id, "logo_removed");
+  await ctx.answerCbQuery("Logo removed 🗑️");
+  // Refresh the style screen if the button was pressed there
+  const onStyle = ctx.callbackQuery.message && ctx.callbackQuery.message.text && ctx.callbackQuery.message.text.startsWith("🎨 QR style");
+  if (onStyle) return refreshStyle(ctx);
+  return removeButtons(ctx);
+});
+
+bot.action("style:preview", async (ctx) => {
+  if (isRateLimited(ctx.from.id)) return ctx.answerCbQuery("Please wait a moment.");
+  await ctx.answerCbQuery("Building preview…");
+  try {
+    const settings = { ...getSettings(ctx.from.id) };
+    const png = await renderPng("https://t.me/", settings, 500);
+    const extra = {
+      caption: "👁️ Preview of your current style",
+      reply_markup: Markup.inlineKeyboard([
+        [Markup.button.callback("🎨 Colours", "go:colors"), Markup.button.callback("⚙️ Style", "go:style")],
+      ]).reply_markup,
+    };
+    return settings.transparent
+      ? await ctx.replyWithDocument({ source: png, filename: "preview.png" }, extra)
+      : await ctx.replyWithPhoto({ source: png, filename: "preview.png" }, extra);
+  } catch (error) {
+    console.error("Preview failed:", error);
+    return ctx.reply("Sorry, I couldn't build the preview.");
+  }
+});
+
+// Colour picker
+bot.action(/^col:(d|l):([0-9a-fA-F]{6})$/, async (ctx) => {
+  const side = ctx.match[1] === "d" ? "dark" : "light";
+  const hex = `#${ctx.match[2].toLowerCase()}`;
+  const settings = getSettings(ctx.from.id);
+  const current = resolveTheme(settings);
+
+  const next = { dark: current.dark, light: current.light, [side]: hex };
+  const ratio = contrastRatio(next.dark, next.light);
+  if (ratio < 3) {
+    return ctx.answerCbQuery("Too little contrast, it might not scan. Pick another.", { show_alert: true });
+  }
+
+  settings.custom = next;
+  settings.theme = "custom";
+  await saveSettings(ctx.from.id);
+  logActivity(ctx.from.id, "colors_set", next);
+  await ctx.answerCbQuery("Saved ✅");
+  await refreshColours(ctx);
+});
+
+bot.action("col:type", async (ctx) => {
+  await ctx.answerCbQuery();
+  flows.delete(ctx.from.id);
+  awaitingLogo.delete(ctx.from.id);
+  awaitingHex.set(ctx.from.id, Date.now() + FLOW_TTL_MS);
+  return ctx.reply(
+    "⌨️ Send hex codes: code colour, then background (optional).\n\nExample: #1d4ed8 #ffffff",
+    Markup.inlineKeyboard([[Markup.button.callback("✖️ Cancel", "fl:cancel")]])
+  );
+});
+
+// Pro purchase (Telegram Stars)
+bot.action("buy:pro", async (ctx) => {
+  await ctx.answerCbQuery();
+  return ctx.replyWithInvoice({
+    title: "Quick QR Pro",
+    description: `${PRO_DAYS} days: unlimited logo and bulk, higher daily limits.`,
+    payload: `pro:${PRO_DAYS}`,
+    provider_token: "", // must be empty for Telegram Stars
+    currency: "XTR",
+    prices: [{ label: `Pro, ${PRO_DAYS} days`, amount: PRO_STARS }],
+  });
 });
 
 // Downloads read from the database, so they keep working after restarts
@@ -1583,6 +2146,12 @@ bot.action(/^dl:(png|svg):(\d+)$/, async (ctx) => {
 
   if (!entry) {
     return ctx.answerCbQuery("This QR code is no longer in your history. Please generate it again.", { show_alert: true });
+  }
+
+  const quota = await checkQuota(ctx.from.id, "download");
+  if (!quota.ok) {
+    await ctx.answerCbQuery();
+    return replyLimit(ctx, "download", quota);
   }
 
   await ctx.answerCbQuery("Preparing your file…");
@@ -1597,6 +2166,7 @@ bot.action(/^dl:(png|svg):(\d+)$/, async (ctx) => {
       const svg = await renderSvg(entry.payload, settings);
       await ctx.replyWithDocument({ source: Buffer.from(svg, "utf8"), filename: "qr-code.svg" });
     }
+    await bumpUsage(ctx.from.id, "download");
     logActivity(ctx.from.id, "qr_downloaded", { format, history_id: Number(entry.id) });
   } catch (error) {
     console.error("QR download failed:", error);
@@ -1604,7 +2174,6 @@ bot.action(/^dl:(png|svg):(\d+)$/, async (ctx) => {
   }
 });
 
-// Buttons on messages created before history existed
 bot.action(/^dl:(png|svg)$/, (ctx) =>
   ctx.answerCbQuery("This is an old button. Please generate the QR code again.", { show_alert: true })
 );
@@ -1625,6 +2194,12 @@ bot.action(/^prm:(single|sheet6|sheet12):(\d+)$/, async (ctx) => {
     return ctx.answerCbQuery("This QR code is no longer in your history.", { show_alert: true });
   }
 
+  const quota = await checkQuota(ctx.from.id, "print");
+  if (!quota.ok) {
+    await ctx.answerCbQuery();
+    return replyLimit(ctx, "print", quota);
+  }
+
   await ctx.answerCbQuery("Building your PDF…");
   try {
     await ctx.sendChatAction("upload_document");
@@ -1633,6 +2208,7 @@ bot.action(/^prm:(single|sheet6|sheet12):(\d+)$/, async (ctx) => {
       { source: pdf, filename: `qr-print-${modeId}.pdf` },
       { caption: `🖨️ ${PRINT_MODES[modeId].name}: print at 100% scale (no "fit to page") for the sharpest result.` }
     );
+    await bumpUsage(ctx.from.id, "print");
     logActivity(ctx.from.id, "qr_printed", { mode: modeId, history_id: Number(entry.id) });
   } catch (error) {
     console.error("Print PDF failed:", error);
@@ -1645,7 +2221,6 @@ bot.action(/^hist:(\d+)$/, async (ctx) => {
   const { text, keyboard } = await historyView(ctx.from.id, Number(ctx.match[1]));
   logActivity(ctx.from.id, "history_viewed", { page: Number(ctx.match[1]) });
 
-  // Tapping "History" under a QR code sends a new message; paging inside the list edits it in place
   const isListMessage = ctx.callbackQuery.message && ctx.callbackQuery.message.text && ctx.callbackQuery.message.text.startsWith("📜");
   if (isListMessage) {
     try {
@@ -1691,11 +2266,7 @@ bot.action(/^h:del:(\d+)$/, async (ctx) => {
   await ctx.answerCbQuery(deleted ? "Deleted from history 🗑️" : "Already deleted.");
   if (deleted) {
     logActivity(ctx.from.id, "qr_deleted", { history_id: Number(ctx.match[1]) });
-    try {
-      await ctx.editMessageReplyMarkup(undefined);
-    } catch (_) {
-      /* ignore */
-    }
+    await removeButtons(ctx);
   }
 });
 
@@ -1704,22 +2275,25 @@ bot.action("h:clearyes", async (ctx) => {
   logActivity(ctx.from.id, "history_cleared", { count: result.rowCount });
   await ctx.answerCbQuery("History cleared");
   try {
-    await ctx.editMessageText(`🗑️ Deleted ${result.rowCount} QR code${result.rowCount === 1 ? "" : "s"} from your history.`);
+    await ctx.editMessageText(
+      `🗑️ Deleted ${result.rowCount} QR code${result.rowCount === 1 ? "" : "s"} from your history.`,
+      homeButton()
+    );
   } catch (_) {
     /* ignore */
   }
 });
 
 bot.action("h:wipeyes", async (ctx) => {
-  // Deleting the user row cascades to settings, history and activity
+  // Deleting the user row cascades to settings, history and activity.
+  // user_plan and usage_daily have no foreign key, so Pro and trial counters survive.
   await pool.query("DELETE FROM users WHERE id = $1", [ctx.from.id]);
   settingsByUser.delete(ctx.from.id);
   loadedUsers.delete(ctx.from.id);
-  flows.delete(ctx.from.id);
-  awaitingLogo.delete(ctx.from.id);
+  clearPending(ctx.from.id);
   await ctx.answerCbQuery("Everything deleted");
   try {
-    await ctx.editMessageText("✅ All your stored data has been deleted. You can keep using the bot, and new activity will be saved again.");
+    await ctx.editMessageText("✅ Your stored data has been deleted. You can keep using the bot, and new activity will be saved again.", homeButton());
   } catch (_) {
     /* ignore */
   }
@@ -1728,36 +2302,13 @@ bot.action("h:wipeyes", async (ctx) => {
 bot.action("h:no", async (ctx) => {
   await ctx.answerCbQuery("Okay, nothing was deleted.");
   try {
-    await ctx.editMessageText("Okay, nothing was deleted.");
+    await ctx.editMessageText("Okay, nothing was deleted.", homeButton());
   } catch (_) {
     /* ignore */
   }
 });
 
-// ---------------------------------------------------------------------------
 // Donations
-// ---------------------------------------------------------------------------
-// Option 1: Telegram Stars (built in, no payment provider needed)
-// Option 2: an external link (Paystack, Flutterwave, Buy Me a Coffee, etc.)
-//           set DONATE_LINK in your .env to show it as a button
-const DONATE_LINK = process.env.DONATE_LINK;
-const STAR_AMOUNTS = [25, 50, 100, 250];
-
-bot.command("donate", (ctx) => {
-  const rows = [STAR_AMOUNTS.map((n) => Markup.button.callback(`⭐ ${n}`, `donate:${n}`))];
-
-  if (DONATE_LINK) {
-    rows.push([Markup.button.url("💳 Donate by card or bank transfer", DONATE_LINK)]);
-  }
-
-  return ctx.reply(
-    "❤️ Quick QR Generator is free to use. If it's useful to you, you can support its running costs and future features.\n\n" +
-      "Pick an amount in Telegram Stars below" +
-      (DONATE_LINK ? ", or use the card/bank option." : "."),
-    Markup.inlineKeyboard(rows)
-  );
-});
-
 bot.action(/^donate:(\d+)$/, async (ctx) => {
   const amount = Number(ctx.match[1]);
   if (!STAR_AMOUNTS.includes(amount)) return ctx.answerCbQuery("Unknown amount.");
@@ -1767,20 +2318,41 @@ bot.action(/^donate:(\d+)$/, async (ctx) => {
     title: "Support Quick QR Generator",
     description: `Donate ${amount} Stars to keep this bot free and running.`,
     payload: `donation:${amount}`,
-    provider_token: "", // must be empty for Telegram Stars
-    currency: "XTR", // XTR = Telegram Stars
-    prices: [{ label: "Donation", amount }], // Stars invoices take exactly one price item
+    provider_token: "",
+    currency: "XTR",
+    prices: [{ label: "Donation", amount }],
   });
 });
 
 // Telegram requires you to approve the checkout within 10 seconds
 bot.on("pre_checkout_query", (ctx) => ctx.answerPreCheckoutQuery(true));
 
-bot.on(message("successful_payment"), (ctx) => {
+bot.on(message("successful_payment"), async (ctx) => {
   const payment = ctx.message.successful_payment;
+  const payload = String(payment.invoice_payload || "");
+
+  if (payload.startsWith("pro:")) {
+    const days = Number(payload.split(":")[1]) || PRO_DAYS;
+    try {
+      const until = await grantPro(ctx.from.id, days);
+      console.log(`Pro purchased: ${payment.total_amount} ${payment.currency} from user ${ctx.from.id}`);
+      logActivity(ctx.from.id, "pro_purchased", { days, amount: payment.total_amount });
+      return ctx.reply(
+        `🎉 You're Pro until ${fmtDate(until)}!\n\nUnlimited logo and bulk, plus higher daily limits.`,
+        Markup.inlineKeyboard([
+          [Markup.button.callback("📊 My plan", "go:plan"), Markup.button.callback("🏠 Home", "go:home")],
+        ])
+      );
+    } catch (error) {
+      // Payment succeeded but saving failed: log everything needed to fix it by hand
+      console.error(`PRO GRANT FAILED for user ${ctx.from.id}, charge ${payment.telegram_payment_charge_id}:`, error);
+      return ctx.reply("Payment received, but I couldn't activate Pro. Please contact support and we'll fix it right away.");
+    }
+  }
+
   console.log(`Donation received: ${payment.total_amount} ${payment.currency} from user ${ctx.from.id}`);
   logActivity(ctx.from.id, "donation", { amount: payment.total_amount, currency: payment.currency });
-  return ctx.reply("🙏 Thank you so much for your support! It really helps keep this bot running.");
+  return ctx.reply("🙏 Thank you so much for your support! It really helps keep this bot running.", homeButton());
 });
 
 // ---------------------------------------------------------------------------
@@ -1805,7 +2377,7 @@ bot.on("photo", (ctx) => {
 bot.on("document", (ctx) => {
   const doc = ctx.message.document;
   if (!doc.mime_type || !doc.mime_type.startsWith("image/")) {
-    return ctx.reply("I can only read image files. Send a photo or image of a QR code, or send text to create one.");
+    return ctx.reply("I can only read image files. Send a photo of a QR code, or send text to create one.", homeButton());
   }
   if (doc.file_size && doc.file_size > MAX_IMAGE_BYTES) {
     return ctx.reply("That image is too large. Please send one under 10 MB.");
@@ -1818,7 +2390,12 @@ bot.on("text", async (ctx) => {
   const text = ctx.message.text.trim();
 
   if (text.startsWith("/")) {
-    return ctx.reply("I don't know that command. Send /help to see what I can do.");
+    return ctx.reply("I don't know that command.", Markup.inlineKeyboard([[Markup.button.callback("❓ Help", "go:help"), Markup.button.callback("🏠 Home", "go:home")]]));
+  }
+
+  // Waiting for typed hex colours from the colour picker
+  if (takeHexRequest(ctx.from.id)) {
+    return applyColors(ctx, text.split(/\s+/).filter(Boolean));
   }
 
   // If the user is in the middle of a guided setup, treat this as their answer
@@ -1838,7 +2415,7 @@ bot.on("text", async (ctx) => {
 bot.catch(async (error, ctx) => {
   console.error(`Update ${ctx.update.update_id} failed:`, error);
   try {
-    await ctx.reply("Something went wrong. Please try again.");
+    await ctx.reply("Something went wrong. Please try again.", homeButton());
   } catch (_) {
     /* nothing more we can do */
   }
@@ -1854,15 +2431,17 @@ async function setupBotProfile() {
     await bot.telegram.setMyDescription(BOT_DESCRIPTION);
     await bot.telegram.setMyShortDescription(BOT_SHORT_DESCRIPTION);
   } catch (error) {
-    // Non-fatal: the bot works fine without this, you can also set these via @BotFather
     console.warn("Could not update bot profile:", error.message);
   }
 }
 
 async function main() {
-  await initDb(); // creates the tables on first run
-  const me = await bot.telegram.getMe(); // also validates the token
+  await initDb();
+  const me = await bot.telegram.getMe();
   await setupBotProfile();
+
+  pruneUsage();
+  setInterval(pruneUsage, 24 * 60 * 60 * 1000).unref();
 
   if (RETENTION_DAYS) {
     pruneOldHistory();
