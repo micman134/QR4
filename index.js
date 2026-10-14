@@ -1,10 +1,14 @@
 "use strict";
 
-require("http")
-  .createServer((req, res) => res.end("ok"))
-  .listen(process.env.PORT || 3000);
-
 require("dotenv").config();
+const crypto = require("crypto");
+
+require("http")
+  .createServer((req, res) => {
+    if (req.method === "POST" && req.url === "/paystack/webhook") return handlePaystackWebhook(req, res);
+    res.end("ok");
+  })
+  .listen(process.env.PORT || 3000);
 
 const { Telegraf, Markup } = require("telegraf");
 const { message } = require("telegraf/filters");
@@ -70,6 +74,18 @@ const TRIALS = {
 };
 const PRO_STARS = Number(process.env.PRO_PRICE_STARS) || 150;
 const PRO_DAYS = Number(process.env.PRO_DAYS) || 30;
+
+// ----- Paystack (card / bank transfer in Naira). Only the secret key is needed. -----
+const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY || "";
+const PAYSTACK_ENABLED = Boolean(PAYSTACK_SECRET);
+const PRO_PRICE_NGN = Number(process.env.PRO_PRICE_NGN) || 2000;
+const NGN_DONATE_AMOUNTS = (process.env.DONATE_NGN_AMOUNTS || "500,1000,2500,5000")
+  .split(",")
+  .map((n) => Number(n.trim()))
+  .filter((n) => n >= 100);
+const PAYSTACK_EMAIL_DOMAIN = process.env.PAYSTACK_EMAIL_DOMAIN || "quickqr.app";
+const ngn = (n) => `₦${Number(n).toLocaleString("en-NG")}`;
+let botUsername = "";
 
 const THEMES = {
   classic: { name: "Classic", emoji: "⚫", dark: "#000000", light: "#ffffff" },
@@ -253,6 +269,18 @@ CREATE TABLE IF NOT EXISTS user_plan (
   pro_until   TIMESTAMPTZ,
   trials      JSONB NOT NULL DEFAULT '{}'::jsonb
 );
+
+CREATE TABLE IF NOT EXISTS paystack_payments (
+  reference   TEXT PRIMARY KEY,
+  user_id     BIGINT NOT NULL,
+  kind        TEXT NOT NULL,
+  days        INT,
+  amount_kobo BIGINT NOT NULL,
+  status      TEXT NOT NULL DEFAULT 'pending',
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  paid_at     TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS paystack_payments_user_idx ON paystack_payments (user_id, created_at DESC);
 `;
 
 async function initDb() {
@@ -436,9 +464,20 @@ async function grantPro(userId, days) {
 
 const trialsLeft = (plan, feature) => Math.max(0, TRIALS[feature] - (plan.trials[feature] || 0));
 
+// Extra button for people without Telegram Stars
+function ngnProRows(label = "Get Pro") {
+  if (!PAYSTACK_ENABLED) return [];
+  return [[Markup.button.callback(`💳 ${label} · ${ngn(PRO_PRICE_NGN)} (card/transfer)`, "buy:pro:ngn")]];
+}
+
+function proPriceText() {
+  return PAYSTACK_ENABLED ? `${PRO_STARS} Stars or ${ngn(PRO_PRICE_NGN)}` : `${PRO_STARS} Stars`;
+}
+
 function proKeyboard(extra = []) {
   return Markup.inlineKeyboard([
     [Markup.button.callback(`⭐ Get Pro · ${PRO_STARS} Stars`, "buy:pro")],
+    ...ngnProRows(),
     [Markup.button.callback("📊 My plan", "go:plan"), ...extra],
   ]);
 }
@@ -455,7 +494,7 @@ function trialPaywall(ctx, feature) {
   const name = feature === "bulk" ? "bulk" : "logo";
   return ctx.reply(
     `🔒 Your ${TRIALS[feature]} free ${name} trials are used up.\n\n` +
-      `⭐ Pro (${PRO_STARS} Stars, ${PRO_DAYS} days) unlocks unlimited logo, bulk and higher daily limits.`,
+      `⭐ Pro (${proPriceText()}, ${PRO_DAYS} days) unlocks unlimited logo, bulk and higher daily limits.`,
     proKeyboard()
   );
 }
@@ -510,6 +549,7 @@ async function planView(userId) {
 
   const keyboard = Markup.inlineKeyboard([
     [Markup.button.callback(`⭐ ${plan.pro ? "Extend Pro" : "Get Pro"} · ${PRO_STARS} Stars`, "buy:pro")],
+    ...ngnProRows(plan.pro ? "Extend Pro" : "Get Pro"),
     [Markup.button.callback("🏠 Home", "go:home")],
   ]);
   return { text, keyboard };
@@ -1797,7 +1837,7 @@ function describeActivity(row) {
     case "history_viewed":
       return "Viewed history";
     case "donation":
-      return `Donated ${d.amount} Stars`;
+      return d.currency === "NGN" ? `Donated ${ngn(d.amount)}` : `Donated ${d.amount} Stars`;
     case "pro_purchased":
       return `Bought Pro (${d.days} days)`;
     default:
@@ -1813,13 +1853,167 @@ const STAR_AMOUNTS = [25, 50, 100, 250];
 
 function showDonate(ctx) {
   const rows = [STAR_AMOUNTS.map((n) => Markup.button.callback(`⭐ ${n}`, `donate:${n}`))];
-  if (DONATE_LINK) rows.push([Markup.button.url("💳 Card or bank transfer", DONATE_LINK)]);
+  if (PAYSTACK_ENABLED && NGN_DONATE_AMOUNTS.length) {
+    for (let i = 0; i < NGN_DONATE_AMOUNTS.length; i += 4) {
+      rows.push(NGN_DONATE_AMOUNTS.slice(i, i + 4).map((n) => Markup.button.callback(`💳 ${ngn(n)}`, `pdonate:${n}`)));
+    }
+  } else if (DONATE_LINK) {
+    rows.push([Markup.button.url("💳 Card or bank transfer", DONATE_LINK)]);
+  }
   rows.push([Markup.button.callback("⭐ Get Pro instead", "buy:pro"), Markup.button.callback("🏠 Home", "go:home")]);
 
   return ctx.reply(
-    "❤️ Quick QR Generator is free to use. Donations help cover running costs.\n\nPick an amount in Telegram Stars:",
+    "❤️ Quick QR Generator is free to use. Donations help cover running costs.\n\n" +
+      (PAYSTACK_ENABLED
+        ? "⭐ Pay with Telegram Stars, or 💳 pay in Naira with card or bank transfer:"
+        : "Pick an amount in Telegram Stars:"),
     Markup.inlineKeyboard(rows)
   );
+}
+
+// ---------------------------------------------------------------------------
+// Paystack (card / bank transfer). Uses only the secret key.
+// Flow: initialize transaction -> user pays on Paystack page -> we verify with the
+// API (webhook and/or "I've paid" button) -> grant Pro / thank the donor, once.
+// ---------------------------------------------------------------------------
+async function paystackApi(path, options = {}) {
+  const response = await fetch(`https://api.paystack.co${path}`, {
+    ...options,
+    headers: { Authorization: `Bearer ${PAYSTACK_SECRET}`, "Content-Type": "application/json" },
+  });
+  const json = await response.json().catch(() => ({}));
+  if (!response.ok || json.status === false) {
+    throw new Error(json.message || `Paystack error ${response.status}`);
+  }
+  return json.data;
+}
+
+async function startPaystackCheckout(ctx, kind, amountNgn) {
+  if (!PAYSTACK_ENABLED) {
+    return ctx.reply("Card and bank payments aren't available right now. You can pay with Telegram Stars instead.", homeButton());
+  }
+  const uid = ctx.from.id;
+  const days = kind === "pro" ? PRO_DAYS : null;
+  const amountKobo = Math.round(amountNgn * 100);
+  // Paystack references allow letters, numbers, "-", "." and "="
+  const reference = `qq-${uid}-${Date.now().toString(36)}-${crypto.randomBytes(3).toString("hex")}`;
+
+  try {
+    await pool.query(
+      "INSERT INTO paystack_payments (reference, user_id, kind, days, amount_kobo) VALUES ($1, $2, $3, $4, $5)",
+      [reference, uid, kind, days, amountKobo]
+    );
+    const data = await paystackApi("/transaction/initialize", {
+      method: "POST",
+      body: JSON.stringify({
+        email: `user${uid}@${PAYSTACK_EMAIL_DOMAIN}`,
+        amount: amountKobo,
+        currency: "NGN",
+        reference,
+        callback_url: botUsername ? `https://t.me/${botUsername}` : undefined,
+        metadata: { telegram_user_id: uid, kind, days },
+      }),
+    });
+
+    const title = kind === "pro" ? `Quick QR Pro, ${PRO_DAYS} days` : "Donation";
+    return ctx.reply(
+      `💳 ${title}: ${ngn(amountNgn)}\n\nTap Pay, finish on the Paystack page (card, bank transfer or USSD), then come back. ` +
+        "Pro activates automatically. If nothing happens after a minute, tap \"I've paid\".",
+      Markup.inlineKeyboard([
+        [Markup.button.url(`💳 Pay ${ngn(amountNgn)}`, data.authorization_url)],
+        [Markup.button.callback("✅ I've paid, check now", `pscheck:${reference}`)],
+      ])
+    );
+  } catch (error) {
+    console.error("Paystack initialize failed:", error.message);
+    return ctx.reply("I couldn't start the payment. Please try again in a moment.", homeButton());
+  }
+}
+
+// Verifies with Paystack and fulfils exactly once. Safe to call from webhook and button together.
+async function fulfillPaystack(reference) {
+  const { rows } = await pool.query("SELECT * FROM paystack_payments WHERE reference = $1", [reference]);
+  const row = rows[0];
+  if (!row) return { state: "unknown" };
+  if (row.status === "paid") return { state: "already", row };
+
+  const tx = await paystackApi(`/transaction/verify/${encodeURIComponent(reference)}`);
+  if (tx.status === "failed" || tx.status === "reversed") return { state: "failed", row };
+  if (tx.status !== "success") return { state: "pending", row };
+
+  if (Number(tx.amount) !== Number(row.amount_kobo) || tx.currency !== "NGN") {
+    console.error(`PAYSTACK MISMATCH ${reference}: paid ${tx.amount} ${tx.currency}, expected ${row.amount_kobo} NGN`);
+    return { state: "mismatch", row };
+  }
+
+  // Claim the payment so only one caller fulfils it
+  const claim = await pool.query(
+    "UPDATE paystack_payments SET status = 'paid', paid_at = now() WHERE reference = $1 AND status = 'pending' RETURNING reference",
+    [reference]
+  );
+  if (!claim.rowCount) return { state: "already", row };
+
+  const userId = Number(row.user_id);
+  const amountNgn = Number(row.amount_kobo) / 100;
+  try {
+    if (row.kind === "pro") {
+      const days = Number(row.days) || PRO_DAYS;
+      const until = await grantPro(userId, days);
+      console.log(`Pro purchased via Paystack: ${amountNgn} NGN from user ${userId}`);
+      logActivity(userId, "pro_purchased", { days, amount: amountNgn, currency: "NGN" });
+      await bot.telegram
+        .sendMessage(
+          userId,
+          `🎉 Payment received. You're Pro until ${fmtDate(until)}!\n\nUnlimited logo and bulk, plus higher daily limits.`,
+          Markup.inlineKeyboard([[Markup.button.callback("📊 My plan", "go:plan"), Markup.button.callback("🏠 Home", "go:home")]])
+        )
+        .catch(() => {});
+    } else {
+      console.log(`Donation via Paystack: ${amountNgn} NGN from user ${userId}`);
+      logActivity(userId, "donation", { amount: amountNgn, currency: "NGN" });
+      await bot.telegram
+        .sendMessage(userId, "🙏 Thank you so much for your support! It really helps keep this bot running.", homeButton())
+        .catch(() => {});
+    }
+  } catch (error) {
+    // Paid but could not grant: put it back to pending so the button or next webhook can retry
+    console.error(`PAYSTACK GRANT FAILED for user ${userId}, reference ${reference}:`, error);
+    await pool.query("UPDATE paystack_payments SET status = 'pending', paid_at = NULL WHERE reference = $1", [reference]);
+    throw error;
+  }
+  return { state: "paid", row };
+}
+
+// Paystack calls this when a payment succeeds. Set the URL in your Paystack dashboard:
+// Settings > API Keys & Webhooks > Webhook URL: https://YOUR-APP-URL/paystack/webhook
+function handlePaystackWebhook(req, res) {
+  const chunks = [];
+  let size = 0;
+  req.on("data", (chunk) => {
+    size += chunk.length;
+    if (size > 1024 * 1024) return req.destroy();
+    chunks.push(chunk);
+  });
+  req.on("end", () => {
+    const raw = Buffer.concat(chunks);
+    const given = String(req.headers["x-paystack-signature"] || "");
+    const expected = PAYSTACK_ENABLED ? crypto.createHmac("sha512", PAYSTACK_SECRET).update(raw).digest("hex") : "";
+    const valid = expected && given.length === expected.length && crypto.timingSafeEqual(Buffer.from(given), Buffer.from(expected));
+    if (!valid) {
+      res.statusCode = 401;
+      return res.end("invalid signature");
+    }
+    res.statusCode = 200;
+    res.end("ok");
+    try {
+      const event = JSON.parse(raw.toString("utf8"));
+      if (event.event === "charge.success" && event.data && event.data.reference) {
+        fulfillPaystack(event.data.reference).catch((error) => console.error("Paystack webhook fulfil failed:", error.message));
+      }
+    } catch (error) {
+      console.error("Paystack webhook parse failed:", error.message);
+    }
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -2139,6 +2333,47 @@ bot.action("buy:pro", async (ctx) => {
   });
 });
 
+// Pro and donations with Paystack (for people without Telegram Stars)
+bot.action("buy:pro:ngn", async (ctx) => {
+  await ctx.answerCbQuery();
+  return startPaystackCheckout(ctx, "pro", PRO_PRICE_NGN);
+});
+
+bot.action(/^pdonate:(\d+)$/, async (ctx) => {
+  const amount = Number(ctx.match[1]);
+  if (!NGN_DONATE_AMOUNTS.includes(amount)) return ctx.answerCbQuery("Unknown amount.");
+  await ctx.answerCbQuery();
+  return startPaystackCheckout(ctx, "donation", amount);
+});
+
+bot.action(/^pscheck:(.+)$/, async (ctx) => {
+  const reference = ctx.match[1];
+  const { rows } = await pool.query("SELECT user_id FROM paystack_payments WHERE reference = $1", [reference]);
+  if (!rows[0] || Number(rows[0].user_id) !== ctx.from.id) {
+    return ctx.answerCbQuery("Payment not found.", { show_alert: true });
+  }
+  try {
+    const result = await fulfillPaystack(reference);
+    switch (result.state) {
+      case "paid":
+        await ctx.answerCbQuery("Payment confirmed ✅");
+        return removeButtons(ctx);
+      case "already":
+        await ctx.answerCbQuery("This payment is already confirmed ✅", { show_alert: true });
+        return removeButtons(ctx);
+      case "failed":
+        return ctx.answerCbQuery("This payment failed. Please start again.", { show_alert: true });
+      case "mismatch":
+        return ctx.answerCbQuery("Payment amount did not match. Please contact support.", { show_alert: true });
+      default:
+        return ctx.answerCbQuery("Payment not received yet. Finish paying on the Paystack page, then tap again.", { show_alert: true });
+    }
+  } catch (error) {
+    console.error("pscheck failed:", error.message);
+    return ctx.answerCbQuery("Couldn't check right now. Try again in a moment.", { show_alert: true });
+  }
+});
+
 // Downloads read from the database, so they keep working after restarts
 bot.action(/^dl:(png|svg):(\d+)$/, async (ctx) => {
   const format = ctx.match[1];
@@ -2438,6 +2673,7 @@ async function setupBotProfile() {
 async function main() {
   await initDb();
   const me = await bot.telegram.getMe();
+  botUsername = me.username;
   await setupBotProfile();
 
   pruneUsage();
