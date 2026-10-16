@@ -51,6 +51,15 @@ const ACTIVITY_LIMIT = 15;
 const RETENTION_DAYS = Number(process.env.HISTORY_RETENTION_DAYS) || 0; // 0 = keep forever
 const DISPLAY_TZ = process.env.DISPLAY_TZ || "Africa/Lagos";
 
+// ----- Support: users message the admin through the bot -----
+// ADMIN_ID = the Telegram user ID that receives support messages (that account must have pressed /start on this bot).
+// SUPPORT_USERNAME (optional) = fallback "@username" shown as a chat link if ADMIN_ID is not set or cannot be reached.
+const ADMIN_ID = Number(process.env.ADMIN_ID || process.env.ADMIN_CHAT_ID) || 0;
+const SUPPORT_USERNAME = (process.env.SUPPORT_USERNAME || "").replace(/^@/, "");
+const SUPPORT_ENABLED = Boolean(ADMIN_ID || SUPPORT_USERNAME);
+const SUPPORT_MAX_PER_HOUR = Number(process.env.SUPPORT_MAX_PER_HOUR) || 5;
+const SUPPORT_MAX_LENGTH = 3000;
+
 // ----- Daily limits, free trials and Pro (paid with Telegram Stars) -----
 // LIMITS[feature] = [free per day, Pro per day]. Counters reset at midnight in DISPLAY_TZ.
 const LIMITS = {
@@ -94,6 +103,17 @@ const THEMES = {
   purple: { name: "Purple", emoji: "🟣", dark: "#7e22ce", light: "#ffffff" },
   red: { name: "Red", emoji: "🔴", dark: "#b91c1c", light: "#ffffff" },
 };
+
+// Code designs. "lego" builds every dark module as a Lego brick with a stud.
+const DESIGNS = {
+  classic: { name: "Classic", emoji: "⬛" },
+  lego: { name: "Lego", emoji: "🧱" },
+  legomix: { name: "Lego mix", emoji: "🌈" },
+};
+
+// Brick colours used by "Lego mix": deep red, navy, green, purple, brown. They are deliberately the same darkness,
+// because scanners get confused when neighbouring dark bricks differ a lot in brightness.
+const LEGO_MIX_COLORS = ["#6e1a1a", "#1a3578", "#124625", "#491773", "#522609"];
 
 // Colour picker swatches (hex values are checked for contrast before they are applied)
 const CODE_COLORS = [
@@ -209,6 +229,7 @@ const BOT_COMMANDS = [
   { command: "activity", description: "Recent activity" },
   { command: "clearhistory", description: "Delete my history" },
   { command: "deletedata", description: "Delete my data" },
+  { command: "support", description: "Contact support" },
   { command: "donate", description: "Support the bot ❤️" },
   { command: "cancel", description: "Cancel current setup" },
 ];
@@ -563,10 +584,13 @@ const flows = new Map();
 const lastActionAt = new Map();
 const awaitingLogo = new Map();
 const awaitingHex = new Map();
+const awaitingSupport = new Map();
+const supportLog = new Map();
 const loadedUsers = new Map();
 
 const defaultSettings = () => ({
   theme: "classic",
+  design: "classic",
   size: "medium",
   ecl: "M",
   transparent: false,
@@ -606,9 +630,10 @@ function takeFlag(map, userId) {
 }
 const takeLogoRequest = (userId) => takeFlag(awaitingLogo, userId);
 const takeHexRequest = (userId) => takeFlag(awaitingHex, userId);
+const takeSupportRequest = (userId) => takeFlag(awaitingSupport, userId);
 
 function clearPending(userId) {
-  const had = flows.delete(userId) | awaitingLogo.delete(userId) | awaitingHex.delete(userId);
+  const had = flows.delete(userId) | awaitingLogo.delete(userId) | awaitingHex.delete(userId) | awaitingSupport.delete(userId);
   return Boolean(had);
 }
 
@@ -617,7 +642,7 @@ setInterval(() => {
   for (const [userId, flow] of flows) {
     if (flow.expires < now) flows.delete(userId);
   }
-  for (const map of [awaitingLogo, awaitingHex]) {
+  for (const map of [awaitingLogo, awaitingHex, awaitingSupport]) {
     for (const [userId, expires] of map) {
       if (expires < now) map.delete(userId);
     }
@@ -726,8 +751,9 @@ function scanHint(payload) {
 function buildCaption(title, summary, payload, settings) {
   const theme = resolveTheme(settings);
   const ecl = settings.logo ? "H" : settings.ecl;
+  const design = DESIGNS[settings.design] && settings.design !== "classic" ? `${DESIGNS[settings.design].emoji} ${DESIGNS[settings.design].name} · ` : "";
   const specs =
-    `${theme.emoji} ${theme.name} · ${SIZES[settings.size].px}px · Accuracy ${ecl}` +
+    `${design}${theme.emoji} ${theme.name} · ${SIZES[settings.size].px}px · Accuracy ${ecl}` +
     (settings.logo ? " · Logo" : "") +
     (settings.transparent ? " · Transparent" : "");
 
@@ -757,9 +783,94 @@ function qrOptions(settings, width) {
   };
 }
 
+// Lego design: every dark module becomes a brick with a stud, drawn as SVG.
+// Shading is kept gentle on purpose: heavy highlights inside the dark modules make scanners struggle.
+const LEGO_MARGIN = 3;
+const isLego = (settings) => settings.design === "lego" || settings.design === "legomix";
+
+// How strong the brick shading is depends on the colour. Near-black takes bold studs, deep colours get medium
+// shading, and lighter mid-tones (amber, bright green) get very gentle shading, because phone cameras struggle
+// with texture inside the dark modules.
+const grayOf = (hex) => {
+  const n = parseInt(hex.slice(1), 16);
+  return 0.299 * (n >> 16) + 0.587 * ((n >> 8) & 255) + 0.114 * (n & 255);
+};
+
+function legoBrick(id, hex) {
+  const g = grayOf(hex);
+  const bold = Math.min(1, Math.max(0, (45 - g) / 20)); // 1 for near-black
+  const soft = Math.min(1, Math.max(0, (g - 70) / 40)); // 1 for light mid-tones
+  const seam = (0.2 - 0.12 * soft).toFixed(2);
+  const shadow = (0.15 + 0.15 * bold - 0.1 * soft).toFixed(2);
+  const ring = (0.12 + 0.23 * bold - 0.08 * soft).toFixed(2);
+  return (
+    `<g id="${id}">` +
+    '<rect width="1" height="1" fill="currentColor"/>' +
+    `<rect width="1" height="1" fill="#000" fill-opacity="${seam}"/>` +
+    '<rect x=".045" y=".045" width=".91" height=".91" rx=".08" fill="currentColor"/>' +
+    `<circle cx=".5" cy=".56" r=".3" fill="#000" fill-opacity="${shadow}"/>` +
+    '<circle cx=".5" cy=".5" r=".3" fill="currentColor"/>' +
+    `<circle cx=".5" cy=".5" r=".3" fill="none" stroke="#000" stroke-opacity="${ring}" stroke-width=".04"/>` +
+    "</g>"
+  );
+}
+
+function legoSvg(payload, settings, width) {
+  const theme = resolveTheme(settings);
+  const qr = QRCode.create(payload, { errorCorrectionLevel: settings.logo ? "H" : settings.ecl });
+  const n = qr.modules.size;
+  const total = n + LEGO_MARGIN * 2;
+
+  let palette = [theme.dark];
+  if (settings.design === "legomix") {
+    const safe = LEGO_MIX_COLORS.filter((c) => contrastRatio(c, theme.light) >= 3.5);
+    if (safe.length > 1) palette = safe; // palette[0] is also used for the three corner squares
+  }
+
+  // Whole pixels per module keeps the edges crisp, which scanners like
+  const cell = Math.max(2, Math.floor((width || SIZES[settings.size].px) / total));
+  const px = cell * total;
+
+  const groups = palette.map(() => []);
+  let seed = 20240517; // fixed seed: the same code always gets the same brick colours
+  for (let r = 0; r < n; r++) {
+    for (let c = 0; c < n; c++) {
+      if (!qr.modules.get(r, c)) continue;
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      // The three big corner squares stay one solid colour so scanners can lock on to them
+      const inEye = (r < 7 && c < 7) || (r < 7 && c >= n - 7) || (r >= n - 7 && c < 7);
+      const i = palette.length > 1 && !inEye ? (seed >> 8) % palette.length : 0;
+      groups[i].push(`<use xlink:href="#b${i}" x="${c + LEGO_MARGIN}" y="${r + LEGO_MARGIN}"/>`);
+    }
+  }
+  const bricks = palette
+    .map((color, i) => (groups[i].length ? `<g color="${color}">${groups[i].join("")}</g>` : ""))
+    .join("");
+
+  const background = settings.transparent
+    ? ""
+    : `<rect width="${total}" height="${total}" fill="${theme.light}"/>` +
+      `<rect width="${total}" height="${total}" fill="url(#plate)"/>`;
+
+  return (
+    `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="${px}" height="${px}" viewBox="0 0 ${total} ${total}">` +
+    "<defs>" +
+    palette.map((color, i) => legoBrick(`b${i}`, color)).join("") +
+    '<pattern id="plate" width="1" height="1" patternUnits="userSpaceOnUse">' +
+    '<circle cx=".5" cy=".5" r=".29" fill="none" stroke="#000" stroke-opacity=".07" stroke-width=".03"/>' +
+    "</pattern>" +
+    "</defs>" +
+    background +
+    bricks +
+    "</svg>"
+  );
+}
+
 async function renderPng(payload, settings, width) {
   const options = qrOptions(settings, width);
-  const base = await QRCode.toBuffer(payload, { ...options, type: "png" });
+  const base = isLego(settings)
+    ? await sharp(Buffer.from(legoSvg(payload, settings, width))).png().toBuffer()
+    : await QRCode.toBuffer(payload, { ...options, type: "png" });
   if (!settings.logo) return base;
 
   const { width: actual } = await sharp(base).metadata();
@@ -782,7 +893,9 @@ async function renderPng(payload, settings, width) {
 }
 
 async function renderSvg(payload, settings) {
-  const svg = await QRCode.toString(payload, { ...qrOptions(settings), type: "svg" });
+  const svg = isLego(settings)
+    ? legoSvg(payload, settings)
+    : await QRCode.toString(payload, { ...qrOptions(settings), type: "svg" });
   if (!settings.logo) return svg;
 
   const vb = /viewBox="0 0 (\d+) (\d+)"/.exec(svg);
@@ -1545,6 +1658,7 @@ function homeKeyboard() {
     Markup.button.callback("❤️ Donate", "go:donate"),
     Markup.button.callback("❓ Help", "go:help"),
   ]);
+  if (SUPPORT_ENABLED) rows.push([supportButton()]);
   return Markup.inlineKeyboard(rows);
 }
 
@@ -1570,6 +1684,7 @@ const HELP_TEXT =
   "/history /print /activity /plan\n" +
   "/clearhistory /deletedata\n\n" +
   "📷 Send a photo to scan a QR code.\n" +
+  (SUPPORT_ENABLED ? "/support to contact the admin 🆘\n" : "") +
   "/donate to support the bot ❤️";
 
 const sendHelp = (ctx) => ctx.reply(HELP_TEXT, homeKeyboard());
@@ -1588,6 +1703,9 @@ async function styleView(userId) {
   if (settings.custom) {
     themeButtons.push(Markup.button.callback(`${mark(settings.theme === "custom")}🎨 Custom`, "style:theme:custom"));
   }
+  const designButtons = Object.entries(DESIGNS).map(([id, d]) =>
+    Markup.button.callback(`${mark((settings.design || "classic") === id)}${d.emoji} ${d.name}`, `style:design:${id}`)
+  );
   const sizeButtons = Object.entries(SIZES).map(([id, s]) =>
     Markup.button.callback(`${mark(settings.size === id)}${s.name}`, `style:size:${id}`)
   );
@@ -1605,6 +1723,7 @@ async function styleView(userId) {
 
   const text =
     "🎨 QR style\n\n" +
+    `Design: ${DESIGNS[settings.design] ? DESIGNS[settings.design].emoji + " " + DESIGNS[settings.design].name : "Classic"}\n` +
     `Colour: ${colourLine}\n` +
     `Size: ${SIZES[settings.size].name} (${SIZES[settings.size].px}px)\n` +
     `Accuracy: ${settings.logo ? "H (logo)" : settings.ecl}\n` +
@@ -1620,6 +1739,8 @@ async function styleView(userId) {
     [Markup.button.callback("▼ Colour", "noop")],
     ...chunk(themeButtons, 3),
     [Markup.button.callback("🎨 Pick custom colours", "go:colors")],
+    [Markup.button.callback("▼ Design", "noop")],
+    designButtons,
     [Markup.button.callback("▼ Size", "noop")],
     sizeButtons,
     [Markup.button.callback("▼ Accuracy", "noop")],
@@ -1737,6 +1858,133 @@ async function askLogo(ctx) {
       trialLine,
     Markup.inlineKeyboard([[Markup.button.callback("✖️ Cancel", "fl:cancel")]])
   );
+}
+
+// ---------------------------------------------------------------------------
+// Support: user -> admin messages and admin replies
+// ---------------------------------------------------------------------------
+function supportButton(label = "🆘 Support") {
+  if (ADMIN_ID) return Markup.button.callback(label, "go:support");
+  return Markup.button.url(label, `https://t.me/${SUPPORT_USERNAME}`);
+}
+
+// Home button, plus Support when it is set up. Used on error messages.
+function helpKeyboard() {
+  const row = [Markup.button.callback("🏠 Home", "go:home")];
+  if (SUPPORT_ENABLED) row.unshift(supportButton());
+  return Markup.inlineKeyboard([row]);
+}
+
+const personName = (from) =>
+  [from.first_name, from.last_name].filter(Boolean).join(" ") || "User";
+
+async function notifyAdmin(text) {
+  if (!ADMIN_ID) return;
+  try {
+    await bot.telegram.sendMessage(ADMIN_ID, clip(text, 3500));
+  } catch (error) {
+    console.warn("Could not notify admin:", error.message);
+  }
+}
+
+async function askSupport(ctx) {
+  if (!SUPPORT_ENABLED) {
+    return ctx.reply("Support isn't available right now. Please try again later.", homeButton());
+  }
+  if (!ADMIN_ID) {
+    return ctx.reply(
+      `🆘 Need help? Message @${SUPPORT_USERNAME} directly.`,
+      Markup.inlineKeyboard([[supportButton("💬 Open chat")], [Markup.button.callback("🏠 Home", "go:home")]])
+    );
+  }
+
+  flows.delete(ctx.from.id);
+  awaitingLogo.delete(ctx.from.id);
+  awaitingHex.delete(ctx.from.id);
+  awaitingSupport.set(ctx.from.id, Date.now() + FLOW_TTL_MS);
+  return ctx.reply(
+    "🆘 Support\n\n" +
+      "Type your message now. You can also send a screenshot with a caption.\n" +
+      "I'll pass it to the admin and their reply will arrive here in this chat.",
+    Markup.inlineKeyboard([[Markup.button.callback("✖️ Cancel", "fl:cancel")]])
+  );
+}
+
+// Forwards the user's next message (text, photo or file) to the admin.
+// The user's ID is written into the message so the admin can answer just by replying to it.
+async function sendSupportMessage(ctx) {
+  const uid = ctx.from.id;
+  const msg = ctx.message;
+  const text = msg.text || msg.caption || "";
+
+  const now = Date.now();
+  const recent = (supportLog.get(uid) || []).filter((t) => now - t < 60 * 60 * 1000);
+  if (recent.length >= SUPPORT_MAX_PER_HOUR) {
+    supportLog.set(uid, recent);
+    return ctx.reply("You've sent several messages to support in the last hour. Please wait a little before sending another.", homeButton());
+  }
+  if (text.length > SUPPORT_MAX_LENGTH) {
+    awaitingSupport.set(uid, Date.now() + FLOW_TTL_MS); // let them try again
+    return ctx.reply(`That message is too long. Please keep it under ${SUPPORT_MAX_LENGTH} characters.`);
+  }
+
+  const plan = await getPlan(uid).catch(() => ({ pro: false }));
+  const header =
+    "🆘 Support request\n" +
+    `From: ${personName(ctx.from)}${ctx.from.username ? ` (@${ctx.from.username})` : ""}\n` +
+    `ID: ${uid}${plan.pro ? " · Pro" : ""}\n` +
+    `[uid:${uid}]\n` +
+    "↩️ Reply to this message to answer the user.\n\n";
+
+  try {
+    if (msg.text) {
+      await ctx.telegram.sendMessage(ADMIN_ID, header + text);
+    } else {
+      await ctx.telegram.copyMessage(ADMIN_ID, ctx.chat.id, msg.message_id, {
+        caption: clip(header + (text || "(no caption)"), 1024),
+      });
+    }
+    recent.push(now);
+    supportLog.set(uid, recent);
+    logActivity(uid, "support_message", { type: msg.text ? "text" : msg.photo ? "photo" : "file" });
+    return ctx.reply(
+      "✅ Sent! The admin will reply here as soon as they can.",
+      Markup.inlineKeyboard([[Markup.button.callback("✍️ Send another", "go:support"), Markup.button.callback("🏠 Home", "go:home")]])
+    );
+  } catch (error) {
+    console.error("Support delivery failed:", error.message);
+    const rows = [[Markup.button.callback("🏠 Home", "go:home")]];
+    if (SUPPORT_USERNAME) rows.unshift([Markup.button.url("💬 Message support directly", `https://t.me/${SUPPORT_USERNAME}`)]);
+    return ctx.reply("Sorry, I couldn't reach support just now. Please try again in a little while.", Markup.inlineKeyboard(rows));
+  }
+}
+
+// Admin answering a support request. Returns true if the message was handled.
+async function adminReply(ctx) {
+  if (!ADMIN_ID || ctx.from.id !== ADMIN_ID) return false;
+  const replied = ctx.message.reply_to_message;
+  if (!replied) return false;
+  const tag = /\[uid:(\d+)\]/.exec(replied.text || replied.caption || "");
+  if (!tag) return false;
+  await deliverAdminReply(ctx, Number(tag[1]));
+  return true;
+}
+
+async function deliverAdminReply(ctx, userId, textOverride) {
+  const keyboard = Markup.inlineKeyboard([[Markup.button.callback("✍️ Reply", "go:support"), Markup.button.callback("🏠 Home", "go:home")]]);
+  try {
+    if (textOverride !== undefined || ctx.message.text) {
+      const body = textOverride !== undefined ? textOverride : ctx.message.text;
+      await ctx.telegram.sendMessage(userId, `💬 Support reply\n\n${body}`, keyboard);
+    } else {
+      const caption = clip(`💬 Support reply${ctx.message.caption ? `\n\n${ctx.message.caption}` : ""}`, 1024);
+      await ctx.telegram.copyMessage(userId, ctx.chat.id, ctx.message.message_id, { caption, reply_markup: keyboard.reply_markup });
+    }
+    return ctx.reply(`✅ Delivered to ${userId}.`);
+  } catch (error) {
+    console.error("Admin reply failed:", error.message);
+    return ctx.reply(`❌ Couldn't deliver to ${userId}. They may have blocked the bot.`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2050,6 +2298,15 @@ bot.use(async (ctx, next) => {
   return next();
 });
 
+// If the user taps another button or runs another command, they are no longer writing to support
+bot.use((ctx, next) => {
+  if (ctx.from && awaitingSupport.has(ctx.from.id)) {
+    const text = ctx.message && ctx.message.text;
+    if ((text && text.startsWith("/")) || ctx.callbackQuery) awaitingSupport.delete(ctx.from.id);
+  }
+  return next();
+});
+
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
@@ -2160,6 +2417,16 @@ bot.command("deletedata", (ctx) =>
 
 bot.command("donate", (ctx) => showDonate(ctx));
 
+bot.command("support", (ctx) => askSupport(ctx));
+
+// Admin fallback: /reply <user id> <message>
+bot.command("reply", async (ctx) => {
+  if (!ADMIN_ID || ctx.from.id !== ADMIN_ID) return;
+  const m = /^\/reply(?:@\w+)?\s+(\d+)\s+([\s\S]+)$/.exec(ctx.message.text.trim());
+  if (!m) return ctx.reply("Usage: /reply <user id> <message>\nOr just reply to a support message.");
+  return deliverAdminReply(ctx, Number(m[1]), m[2]);
+});
+
 // ---------------------------------------------------------------------------
 // Button callbacks
 // ---------------------------------------------------------------------------
@@ -2187,6 +2454,8 @@ bot.action(/^go:(\w+)$/, async (ctx) => {
       return showPrint(ctx);
     case "donate":
       return showDonate(ctx);
+    case "support":
+      return askSupport(ctx);
     case "location":
       return ctx.reply(LOCATION_HELP, homeButton());
     case "plan": {
@@ -2222,10 +2491,10 @@ bot.action("fl:cancel", async (ctx) => {
 });
 
 // Style
-bot.action(/^style:(theme|size|ecl):(\w+)$/, async (ctx) => {
+bot.action(/^style:(theme|size|ecl|design):(\w+)$/, async (ctx) => {
   const [, kind, value] = ctx.match;
   const settings = getSettings(ctx.from.id);
-  const options = { theme: THEMES, size: SIZES, ecl: ECLS }[kind];
+  const options = { theme: THEMES, size: SIZES, ecl: ECLS, design: DESIGNS }[kind];
 
   const valid =
     kind === "theme" && value === "custom"
@@ -2364,7 +2633,7 @@ bot.action(/^pscheck:(.+)$/, async (ctx) => {
       case "failed":
         return ctx.answerCbQuery("This payment failed. Please start again.", { show_alert: true });
       case "mismatch":
-        return ctx.answerCbQuery("Payment amount did not match. Please contact support.", { show_alert: true });
+        return ctx.answerCbQuery("Payment amount did not match. Please contact support with /support.", { show_alert: true });
       default:
         return ctx.answerCbQuery("Payment not received yet. Finish paying on the Paystack page, then tap again.", { show_alert: true });
     }
@@ -2581,7 +2850,11 @@ bot.on(message("successful_payment"), async (ctx) => {
     } catch (error) {
       // Payment succeeded but saving failed: log everything needed to fix it by hand
       console.error(`PRO GRANT FAILED for user ${ctx.from.id}, charge ${payment.telegram_payment_charge_id}:`, error);
-      return ctx.reply("Payment received, but I couldn't activate Pro. Please contact support and we'll fix it right away.");
+      notifyAdmin(
+        `⚠️ PRO GRANT FAILED\nUser: ${ctx.from.id}${ctx.from.username ? ` (@${ctx.from.username})` : ""}\n` +
+          `Amount: ${payment.total_amount} ${payment.currency}\nCharge: ${payment.telegram_payment_charge_id}`
+      );
+      return ctx.reply("Payment received, but I couldn't activate Pro. Please contact support and we'll fix it right away.", helpKeyboard());
     }
   }
 
@@ -2602,14 +2875,18 @@ bot.on("location", (ctx) => {
   });
 });
 
-bot.on("photo", (ctx) => {
+bot.on("photo", async (ctx) => {
+  if (await adminReply(ctx)) return;
+  if (takeSupportRequest(ctx.from.id)) return sendSupportMessage(ctx);
   const photos = ctx.message.photo;
   const fileId = photos[photos.length - 1].file_id;
   if (takeLogoRequest(ctx.from.id)) return saveLogo(ctx, fileId);
   return scanImage(ctx, fileId);
 });
 
-bot.on("document", (ctx) => {
+bot.on("document", async (ctx) => {
+  if (await adminReply(ctx)) return;
+  if (takeSupportRequest(ctx.from.id)) return sendSupportMessage(ctx);
   const doc = ctx.message.document;
   if (!doc.mime_type || !doc.mime_type.startsWith("image/")) {
     return ctx.reply("I can only read image files. Send a photo of a QR code, or send text to create one.", homeButton());
@@ -2627,6 +2904,12 @@ bot.on("text", async (ctx) => {
   if (text.startsWith("/")) {
     return ctx.reply("I don't know that command.", Markup.inlineKeyboard([[Markup.button.callback("❓ Help", "go:help"), Markup.button.callback("🏠 Home", "go:home")]]));
   }
+
+  // Admin answering a support message
+  if (await adminReply(ctx)) return;
+
+  // The user pressed Support and this is their message
+  if (takeSupportRequest(ctx.from.id)) return sendSupportMessage(ctx);
 
   // Waiting for typed hex colours from the colour picker
   if (takeHexRequest(ctx.from.id)) {
@@ -2650,7 +2933,7 @@ bot.on("text", async (ctx) => {
 bot.catch(async (error, ctx) => {
   console.error(`Update ${ctx.update.update_id} failed:`, error);
   try {
-    await ctx.reply("Something went wrong. Please try again.", homeButton());
+    await ctx.reply("Something went wrong. Please try again, or contact support if it keeps happening.", helpKeyboard());
   } catch (_) {
     /* nothing more we can do */
   }
